@@ -1,0 +1,104 @@
+apiVersion: k8s.mariadb.com/v1alpha1
+kind: MaxScale
+metadata:
+  name: maxscale-galera
+spec:
+  replicas: 2
+
+  mariaDbRef:
+    name: mariadb-galera
+
+  # Trigger a switchover by declaring the desired primary server
+  # primaryServer: mariadb-repl-0
+
+  # Declare filters to reject, alter or log requests before they reach the router.
+  # Filters are not applied automatically: reference them by name from the services below.
+  # See: https://mariadb.com/docs/maxscale/reference/maxscale-filters
+  # filters:
+  #   - name: throttle
+  #     module: throttlefilter
+  #     params:
+  #       max_qps: "500"
+  #       throttling_duration: 60000ms
+
+  services:
+    - name: rw-router
+      router: readwritesplit
+      listener:
+        port: 3306
+      # Apply the filters declared in 'spec.filters' to this service, in order
+      # filters:
+      #   - throttle
+
+  monitor:
+    interval: 2s
+    cooperativeMonitoring: majority_of_all
+    params:
+      disable_master_failback: "false"
+      available_when_donor: "false"
+      disable_master_role_setting: "false"   
+
+  admin:
+    port: 8989
+    guiEnabled: true
+
+  config:
+    sync:
+      database: mysql
+      interval: 5s
+      timeout: 10s
+
+  auth:
+    generate: true
+
+  kubernetesService:
+    type: LoadBalancer
+    metadata:
+      annotations:
+        metallb.io/loadBalancerIPs: 172.18.0.224
+  
+  guiKubernetesService:
+    type: LoadBalancer
+    metadata:
+      annotations:
+        metallb.io/loadBalancerIPs: 172.18.0.231
+
+  connection:
+    secretName: mxs-galera-conn
+    port: 3306
+
+  metrics:
+    enabled: true
+
+  # tls:
+  #   enabled: true
+    # Issue certificates with a existing cert-manager ClusterIssuer
+    # adminCertIssuerRef:
+    #   name: root-ca
+    #   kind: ClusterIssuer
+    # listenerCertIssuerRef:
+    #   name: root-ca
+    #   kind: ClusterIssuer
+    # Configure existing certificates available in a Secret
+    # adminCASecretRef:
+    #   name: maxscale-admin-ca
+    # adminCertSecretRef:
+    #   name: maxscale-galera-admin-tls
+    # listenerCASecretRef:
+    #   name: maxscale-listener-ca
+    # listenerCertSecretRef:
+    #   name: maxscale-galera-listener-tls
+    # serverCASecretRef:
+    #   name: mariadb-galera-ca-bundle
+    # serverCertSecretRef:
+    #   name: mariadb-galera-client-tls
+    # verifyPeerCertificate: true
+    # verifyPeerHost: false
+
+  # maintenance:
+  #   # Configure maintenance mode
+  #   enabled: true
+  #   # Do not allow connections through
+  #   cordon: false
+
+  requeueInterval: 1h

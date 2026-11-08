@@ -1,0 +1,11 @@
+apiVersion: k8s.mariadb.com/v1alpha1
+kind: PhysicalBackup
+metadata:
+  name: physicalbackup
+spec:
+  mariaDbRef:
+    name: mariadb
+  target: Replica
+  storage:
+    volumeSnapshot:
+      volumeSnapshotClassName: csi-hostpath-snapclass

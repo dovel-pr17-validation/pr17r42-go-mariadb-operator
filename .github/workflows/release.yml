@@ -1,0 +1,184 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+env:
+  GORELEASER_VERSION: "v2.2.0"
+
+jobs:
+  args:
+    name: Arguments
+    runs-on: ubuntu-latest
+    outputs:
+      BUILD_DATE: ${{ steps.args.outputs.BUILD_DATE }}
+      VERSION: ${{ steps.args.outputs.VERSION }}
+      RELEASE_ARGS: ${{ steps.args.outputs.RELEASE_ARGS }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Fetch tags
+        run: git fetch --force --tags
+
+      - name: Args
+        id: args
+        run: |
+          VERSION=${GITHUB_REF/refs\/tags\//}
+          MAKE_VERSION=$(make version)
+
+          if [ "$VERSION" != "$MAKE_VERSION" ]; then
+            echo "Version('$VERSION') and Makefile version('$MAKE_VERSION') don't match!"
+            exit 1;
+          fi
+
+          RELEASE_ARGS=release
+          RELEASE_HEADER_TMPL=docs/releases/RELEASE_${VERSION}_HEADER.md.gotmpl
+          RELEASE_FOOTER_TMPL=docs/releases/RELEASE_${VERSION}_FOOTER.md.gotmpl
+          if [ -f "${RELEASE_HEADER_TMPL}" ]; then
+            RELEASE_ARGS="${RELEASE_ARGS} --release-header-tmpl=${RELEASE_HEADER_TMPL}"
+          else
+            RELEASE_ARGS="${RELEASE_ARGS} --release-header-tmpl=docs/releases/RELEASE_HEADER.md.gotmpl"
+          fi
+          if [ -f "${RELEASE_FOOTER_TMPL}" ]; then
+            RELEASE_ARGS="${RELEASE_ARGS} --release-footer-tmpl=${RELEASE_FOOTER_TMPL}"
+          else
+            RELEASE_ARGS="${RELEASE_ARGS} --release-footer-tmpl=docs/releases/RELEASE_FOOTER.md.gotmpl"
+          fi
+
+          echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "RELEASE_ARGS=${RELEASE_ARGS}" >> $GITHUB_OUTPUT
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: args
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        id: buildx
+
+      - name: Login GHCR
+        uses: docker/login-action@v4
+        with:
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: ghcr.io
+
+      - name: Publish multi-arch Docker image
+        uses: docker/build-push-action@v7
+        with:
+          push: true
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64,linux/amd64
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/mariadb-operator:${{ needs.args.outputs.VERSION }}
+            ghcr.io/${{ github.repository_owner }}/mariadb-operator:latest
+          labels: |
+            org.opencontainers.image.title=${{ github.event.repository.name }}
+            org.opencontainers.image.description=${{ github.event.repository.description }}
+            org.opencontainers.image.source=${{ github.event.repository.html_url }}
+            org.opencontainers.image.url=${{ github.event.repository.html_url }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.args.outputs.VERSION }}
+            org.opencontainers.image.created=${{ needs.args.outputs.BUILD_DATE }}
+
+  goreleaser:
+    name: Goreleaser
+    runs-on: ubuntu-latest
+    needs:
+      - args
+      - release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Fetch tags
+        run: git fetch --force --tags
+
+      - name: Set GORELEASER_PREVIOUS_TAG
+        run: echo "GORELEASER_PREVIOUS_TAG=$(git tag -l --sort=-version:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n 2 | tail -n 1)" >> $GITHUB_ENV
+
+      - name: GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: ${{ env.GORELEASER_VERSION }}
+          args: ${{ needs.args.outputs.RELEASE_ARGS }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  helm:
+    name: Helm
+    runs-on: ubuntu-latest
+    needs:
+      - args
+      - goreleaser
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: "${{ secrets.GHA_TOKEN }}"
+          ref: "${{ github.event.repository.default_branch }}"
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Bump version
+        id: version
+        env:
+          HELM_CHART_VERSION: ${{ needs.args.outputs.VERSION }}
+        run: make helm-version-bump
+
+      - name: Helm generate
+        run: make helm-gen
+
+      - name: Commit changes
+        run: |
+          git add .
+          git commit -am "Bump helm chart versions to ${{ needs.args.outputs.VERSION }}"
+          git push
+
+  gopkg:
+    name: Go package
+    runs-on: ubuntu-latest
+    needs:
+      - args
+      - helm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: "${{ secrets.GHA_TOKEN }}"
+          ref: "${{ github.event.repository.default_branch }}"
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Push Go package compatible tag
+        run: |
+          git tag "v${{ needs.args.outputs.VERSION }}"
+          git push --tags
+

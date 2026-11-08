@@ -1,0 +1,126 @@
+# Official MinIO images are no longer publicly available in quay.io nor docker.io.
+image:
+  repository: docker.io/pgsty/minio
+  tag: RELEASE.2026-08-04T00-00-00Z
+mcImage:
+  repository: docker.io/pgsty/mc
+  tag: RELEASE.2026-09-16T00-00-00Z
+
+minioAPIPort: "9000"
+minioConsolePort: "9001"
+
+mode: standalone
+
+rootUser: root
+rootPassword: Minio11!
+
+persistence:
+  size: 5Gi
+
+resources:
+  requests:
+    memory: 512Mi
+
+tls:
+  enabled: true
+  certSecret: minio-tls
+  publicCrt: tls.crt
+  privateKey: tls.key
+
+users:
+  - accessKey: console
+    secretKey: Minio11!
+    policy: consoleAdmin
+  - accessKey: mariadb-operator
+    secretKey: Minio11!
+    policy: readwrite
+
+buckets:
+  - name: backups
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+  - name: physicalbackups
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+  - name: binlogs
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+  - name: multi-cluster
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+  - name: scaleout
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+  - name: test-backup
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+  - name: test-physicalbackup
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+  - name: test-restore
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+  - name: test-pitr
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+  - name: test-mariadb
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+  - name: test-mariadb-physical
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+  - name: test-replication-restore-from-backup
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+  - name: test-replication-scale-out
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+  - name: test-replication-recovery
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+  - name: test-mariadb-galera-physical
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+  - name: test-multi-cluster
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+  - name: test-semi-sync
+    policy: none
+    purge: false
+    versioning: false
+    objectlocking: false
+
+securityContext:
+  enabled: false

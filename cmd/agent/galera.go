@@ -1,0 +1,142 @@
+package agent
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"sync"
+
+	"github.com/go-logr/logr"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/agent/handler"
+	galerahandler "github.com/mariadb-operator/mariadb-operator/v26/pkg/agent/handler/galera"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/agent/router"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/agent/server"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/environment"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/filemanager"
+	mdbhttp "github.com/mariadb-operator/mariadb-operator/v26/pkg/http"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/log"
+	"github.com/spf13/cobra"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+var galeraCommand = &cobra.Command{
+	Use:   "galera",
+	Short: "Galera.",
+	Long:  "Galera agent.",
+	Args:  cobra.NoArgs,
+	Run: func(cmd *cobra.Command, args []string) {
+		if err := log.SetupLoggerWithCommand(cmd); err != nil {
+			fmt.Printf("error setting up logger: %v\n", err)
+			os.Exit(1)
+		}
+		logger.Info("Galera agent starting")
+
+		//@WARN: The `PodEnvironment` should always be passed as a reference. See: `pkg/agent/handler/environment.go`
+		env, err := environment.GetPodEnv(context.Background())
+		if err != nil {
+			logger.Error(err, "Error getting environment variables")
+			os.Exit(1)
+		}
+		fileManager, err := filemanager.NewFileManager(configDir, stateDir)
+		if err != nil {
+			logger.Error(err, "Error creating file manager")
+			os.Exit(1)
+		}
+		restConfig, err := ctrl.GetConfig()
+		if err != nil {
+			logger.Error(err, "Error getting REST config")
+			os.Exit(1)
+		}
+		k8sClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+		if err != nil {
+			logger.Error(err, "Error getting Kubernetes client")
+			os.Exit(1)
+		}
+
+		apiLogger := logger.WithName("api")
+		responseWriter := mdbhttp.NewResponseWriter(&apiLogger)
+		apiHandlers := []router.RouteHandler{
+			galerahandler.NewGaleraHandler(
+				fileManager,
+				responseWriter,
+				&apiLogger,
+			),
+			handler.NewEnvironmentHandler(
+				env,
+				responseWriter,
+				&apiLogger,
+			),
+		}
+		apiServer, err := getAPIServer(
+			apiHandlers,
+			env,
+			k8sClient,
+			apiLogger,
+		)
+		if err != nil {
+			logger.Error(err, "Error creating API server")
+			os.Exit(1)
+		}
+
+		probeServer, err := getGaleraProbeServer(env, k8sClient, logger.WithName("probe"))
+		if err != nil {
+			logger.Error(err, "Error creating probe server")
+			os.Exit(1)
+		}
+
+		ctx, cancel := newContext()
+		defer cancel()
+		errChan := make(chan error, 2)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+
+			if err := apiServer.Start(ctx); err != nil {
+				errChan <- fmt.Errorf("error starting API server: %v", err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+
+			if err := probeServer.Start(ctx); err != nil {
+				errChan <- fmt.Errorf("error starting probe server: %v", err)
+			}
+		}()
+		go func() {
+			wg.Wait()
+			close(errChan)
+		}()
+
+		if err, ok := <-errChan; ok {
+			logger.Error(err, "Server error")
+			os.Exit(1)
+		}
+		logger.Info("Galera agent stopped")
+	},
+}
+
+func getGaleraProbeServer(env *environment.PodEnvironment, k8sClient client.Client, logger logr.Logger) (*server.Server, error) {
+	handler := galerahandler.NewGaleraProbe(
+		env,
+		k8sClient,
+		mdbhttp.NewResponseWriter(&logger),
+		&logger,
+	)
+	router := router.NewProbeRouter(
+		handler,
+		logger,
+	)
+
+	server, err := server.NewServer(
+		probeAddr,
+		router,
+		&logger,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return server, nil
+}

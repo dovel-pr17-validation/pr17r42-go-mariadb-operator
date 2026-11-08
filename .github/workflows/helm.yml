@@ -1,0 +1,211 @@
+name: Helm
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "deploy/charts/**"
+  pull_request:
+    paths:
+      - "deploy/charts/**"
+
+env:
+  HELM_VERSION: "v3.19.2"
+
+jobs:
+  lint-cluster:
+    name: Cluster
+    runs-on: ubuntu-latest
+    env:
+      CT_CONFIG: hack/config/chart-testing/mariadb-cluster.yaml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.9"
+
+      - name: Set up chart-testing
+        uses: helm/chart-testing-action@v2.9.0
+
+      - name: List changed
+        id: list-changed
+        run: |
+          changed=$(ct list-changed --config $CT_CONFIG)
+          if [[ -n "$changed" ]]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Lint
+        if: steps.list-changed.outputs.changed == 'true'
+        run: ct lint --config $CT_CONFIG
+
+  lint-crds:
+    name: CRDs
+    runs-on: ubuntu-latest
+    env:
+      CT_CONFIG: hack/config/chart-testing/mariadb-operator-crds.yaml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.9"
+
+      - name: Set up chart-testing
+        uses: helm/chart-testing-action@v2.9.0
+
+      - name: List changed
+        id: list-changed
+        run: |
+          changed=$(ct list-changed --config $CT_CONFIG)
+          if [[ -n "$changed" ]]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Lint
+        if: steps.list-changed.outputs.changed == 'true'
+        run: ct lint --config $CT_CONFIG
+
+      - name: Cluster
+        if: steps.list-changed.outputs.changed == 'true'
+        run: make cluster
+
+      - name: Test install
+        if: steps.list-changed.outputs.changed == 'true'
+        run: ct install --config $CT_CONFIG
+
+  lint-operator:
+    name: Operator
+    runs-on: ubuntu-latest
+    env:
+      CT_CONFIG: hack/config/chart-testing/mariadb-operator.yaml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.9"
+
+      - name: Set up chart-testing
+        uses: helm/chart-testing-action@v2.9.0
+
+      - name: List changed
+        id: list-changed
+        run: |
+          changed=$(ct list-changed --config $CT_CONFIG)
+          if [[ -n "$changed" ]]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Lint
+        if: steps.list-changed.outputs.changed == 'true'
+        run: ct lint --config $CT_CONFIG
+
+      - name: Cluster
+        if: steps.list-changed.outputs.changed == 'true'
+        run: |
+          make cluster
+          make docker-build
+          make docker-load
+
+      - name: Test install
+        if: steps.list-changed.outputs.changed == 'true'
+        run: ct install --config $CT_CONFIG --helm-extra-set-args "--set=crds.enabled=true"
+
+  release:
+    runs-on: ubuntu-latest
+    needs:
+      - lint-cluster
+      - lint-crds
+      - lint-operator
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: "${{ secrets.GHA_TOKEN }}"
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+
+      - name: Run chart-releaser
+        id: chart-releaser
+        uses: helm/chart-releaser-action@v1.7.0
+        env:
+          CR_TOKEN: "${{ secrets.GHA_TOKEN }}"
+          CR_RELEASE_NAME_TEMPLATE: "{{ .Name }}-{{ .Version }}"
+        with:
+          charts_dir: deploy/charts
+          skip_existing: "true"
+          pages_branch: gh-pages
+          packages_with_index: true
+
+      # See: https://github.com/helm/chart-releaser/issues/183
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # See:
+      # https://github.com/prometheus-community/helm-charts/blob/efa63abd06f635cd17ea729a8b91c6643c7d802a/.github/workflows/release.yaml#L89
+      # https://github.com/orgs/prometheus-community/packages?repo_name=helm-charts
+      - name: Push charts to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          shopt -s nullglob
+          for pkg in .cr-release-packages/*.tgz; do
+            if [ -z "${pkg:-}" ]; then
+              break
+            fi
+            # Extract chart name and version from package filename
+            # e.g. mariadb-operator-crds-26.6.0.tgz -> chart_name=mariadb-operator-crds, chart_version=26.6.0
+            chart_name=$(basename "${pkg}" .tgz | sed 's/-[0-9].*$//')
+            chart_version=$(basename "${pkg}" .tgz | sed 's/^.*-\([0-9].*\)$/\1/')
+            repo="oci://ghcr.io/${{ github.repository_owner }}/charts"
+
+            if gh api "/orgs/${{ github.repository_owner }}/packages/container/charts%2F${chart_name}/versions" \
+                --jq ".[].metadata.container.tags[]" 2>/dev/null | grep -q "^${chart_version}$"; then
+              echo "Chart already exists: ${chart_name} ${chart_version}"
+            else
+              echo "Pushing ${chart_name} ${chart_version} to ${repo}"
+              helm push "${pkg}" "${repo}"
+            fi
+          done

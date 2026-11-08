@@ -1,0 +1,845 @@
+package controller
+
+import (
+	"fmt"
+	"sync"
+	"time"
+
+	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/metadata"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/sql"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/statefulset"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+const (
+	// testSemiSyncAckTimeout is deliberately far longer than the time a healthy replica needs to acknowledge, so that a
+	// regression is a hard failure instead of a silent delay: a node armed as a semi-synchronous primary with no
+	// replicas connected to it blocks every binlogged write it performs for this whole duration.
+	testSemiSyncAckTimeout = 100 * time.Hour
+	// testSemiSyncWriteBudget is the time budget for a binlogged write in the primary. It sits well above the
+	// sub-second round trip of a healthy acknowledgement and well below testSemiSyncAckTimeout.
+	testSemiSyncWriteBudget = 15 * time.Second
+	// testSemiSyncBucket is provisioned by 'make install-minio', see 'hack/config/minio.yaml'.
+	testSemiSyncBucket = "test-semi-sync"
+	// testSemiSyncRootPassword and testSemiSyncRootPasswordRotated back the root password rotation spec. This Describe
+	// owns its root password Secret instead of sharing the suite-wide one, so that rotating it does not change the root
+	// password of every other MariaDB in the suite.
+	testSemiSyncRootPassword        = "MariaDB11!"
+	testSemiSyncRootPasswordRotated = "MariaDB22!"
+)
+
+var _ = Describe("MariaDB replication semi-sync", Ordered, func() {
+	var (
+		key = types.NamespacedName{
+			Name:      "mariadb-repl",
+			Namespace: testNamespace,
+		}
+		rootPwdKey = types.NamespacedName{
+			Name:      "mariadb-repl-semi-sync-root",
+			Namespace: testNamespace,
+		}
+		mdb *mariadbv1alpha1.MariaDB
+	)
+
+	// primaryPodIndex refreshes the MariaDB and returns the Pod index the operator currently considers the primary.
+	primaryPodIndex := func() int {
+		Eventually(func(g Gomega) bool {
+			g.Expect(k8sClient.Get(testCtx, key, mdb)).To(Succeed())
+			return mdb.IsReady() && mdb.Status.CurrentPrimaryPodIndex != nil
+		}, testHighTimeout, testInterval).Should(BeTrue())
+		return *mdb.Status.CurrentPrimaryPodIndex
+	}
+
+	BeforeAll(func() {
+		mdb = buildTestMariaDBWithRepl(key)
+		applyMariadbTestConfig(mdb)
+		applySemiSyncTestConfig(mdb)
+
+		By("Creating a dedicated root password Secret")
+		rootPwdSecret := corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      rootPwdKey.Name,
+				Namespace: rootPwdKey.Namespace,
+				// Without this label the operator does not watch the Secret, so rotating it would not trigger a
+				// reconciliation and the spec below would time out waiting for a rotation that never starts.
+				Labels: map[string]string{
+					metadata.WatchLabel: "",
+				},
+			},
+			Data: map[string][]byte{
+				testPwdSecretKey: []byte(testSemiSyncRootPassword),
+			},
+		}
+		Expect(k8sClient.Create(testCtx, &rootPwdSecret)).To(Succeed())
+		DeferCleanup(func() {
+			Expect(k8sClient.Delete(testCtx, &rootPwdSecret)).To(Succeed())
+		})
+
+		mdb.Spec.RootPasswordSecretKeyRef = mariadbv1alpha1.GeneratedSecretKeyRef{
+			SecretKeySelector: mariadbv1alpha1.SecretKeySelector{
+				LocalObjectReference: mariadbv1alpha1.LocalObjectReference{
+					Name: rootPwdKey.Name,
+				},
+				Key: testPwdSecretKey,
+			},
+		}
+
+		By("Creating MariaDB with replication")
+		Expect(k8sClient.Create(testCtx, mdb)).To(Succeed())
+		DeferCleanup(func() {
+			deleteMariadb(key, false)
+		})
+
+		By("Expecting MariaDB to be ready eventually")
+		Eventually(func() bool {
+			if err := k8sClient.Get(testCtx, key, mdb); err != nil {
+				return false
+			}
+			return mdb.IsReady()
+		}, testHighTimeout, testInterval).Should(BeTrue())
+	})
+
+	It("should enable semi-sync in the primary only", func() {
+		primary := primaryPodIndex()
+
+		expectSemiSyncTopology(mdb, primary)
+		expectSemiSyncPrimaryAcknowledged(mdb, primary)
+		expectReplicationConnectionsReady(mdb)
+	})
+
+	It("should not stall binlogged writes in the primary", func() {
+		expectSemiSyncWriteNotStalled(mdb, primaryPodIndex())
+	})
+
+	// SQL resources are reconciled with CREATE USER / GRANT / CREATE DATABASE statements, which are binlogged and
+	// therefore wait for a semi-synchronous acknowledgement. They never become ready against a stalled primary.
+	It("should reconcile SQL resources", func() {
+		sqlKey := types.NamespacedName{
+			Name:      "mariadb-repl-semi-sync",
+			Namespace: testNamespace,
+		}
+
+		database := mariadbv1alpha1.Database{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      sqlKey.Name,
+				Namespace: sqlKey.Namespace,
+			},
+			Spec: mariadbv1alpha1.DatabaseSpec{
+				MariaDBRef: mariadbv1alpha1.MariaDBRef{
+					ObjectReference: mariadbv1alpha1.ObjectReference{
+						Name: key.Name,
+					},
+					WaitForIt: true,
+				},
+				CharacterSet: "utf8",
+				Collate:      "utf8_general_ci",
+			},
+		}
+		user := mariadbv1alpha1.User{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      sqlKey.Name,
+				Namespace: sqlKey.Namespace,
+			},
+			Spec: mariadbv1alpha1.UserSpec{
+				MariaDBRef: mariadbv1alpha1.MariaDBRef{
+					ObjectReference: mariadbv1alpha1.ObjectReference{
+						Name: key.Name,
+					},
+					WaitForIt: true,
+				},
+				PasswordSecretKeyRef: &testPasswordSecretRef,
+				MaxUserConnections:   20,
+			},
+		}
+		grant := mariadbv1alpha1.Grant{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      sqlKey.Name,
+				Namespace: sqlKey.Namespace,
+			},
+			Spec: mariadbv1alpha1.GrantSpec{
+				MariaDBRef: mariadbv1alpha1.MariaDBRef{
+					ObjectReference: mariadbv1alpha1.ObjectReference{
+						Name: key.Name,
+					},
+					WaitForIt: true,
+				},
+				Privileges: []string{
+					"SELECT",
+					"INSERT",
+				},
+				Database: sqlKey.Name,
+				Table:    "*",
+				Username: sqlKey.Name,
+			},
+		}
+
+		By("Creating SQL resources")
+		Expect(k8sClient.Create(testCtx, &database)).To(Succeed())
+		Expect(k8sClient.Create(testCtx, &user)).To(Succeed())
+		Expect(k8sClient.Create(testCtx, &grant)).To(Succeed())
+		// The Grant is revoked first: its finalizer issues a REVOKE against the User, which must still exist.
+		DeferCleanup(func() {
+			By("Deleting Grant")
+			Expect(k8sClient.Delete(testCtx, &grant)).To(Succeed())
+			Eventually(func() bool {
+				return apierrors.IsNotFound(k8sClient.Get(testCtx, sqlKey, &grant))
+			}, testTimeout, testInterval).Should(BeTrue())
+
+			By("Deleting User")
+			Expect(k8sClient.Delete(testCtx, &user)).To(Succeed())
+			Eventually(func() bool {
+				return apierrors.IsNotFound(k8sClient.Get(testCtx, sqlKey, &user))
+			}, testTimeout, testInterval).Should(BeTrue())
+
+			By("Deleting Database")
+			Expect(k8sClient.Delete(testCtx, &database)).To(Succeed())
+			Eventually(func() bool {
+				return apierrors.IsNotFound(k8sClient.Get(testCtx, sqlKey, &database))
+			}, testTimeout, testInterval).Should(BeTrue())
+		})
+
+		By("Expecting Database to be ready eventually")
+		Eventually(func(g Gomega) bool {
+			g.Expect(k8sClient.Get(testCtx, sqlKey, &database)).To(Succeed())
+			return database.IsReady()
+		}, testTimeout, testInterval).Should(BeTrue())
+
+		By("Expecting User to be ready eventually")
+		Eventually(func(g Gomega) bool {
+			g.Expect(k8sClient.Get(testCtx, sqlKey, &user)).To(Succeed())
+			return user.IsReady()
+		}, testTimeout, testInterval).Should(BeTrue())
+
+		By("Expecting Grant to be ready eventually")
+		Eventually(func(g Gomega) bool {
+			g.Expect(k8sClient.Get(testCtx, sqlKey, &grant)).To(Succeed())
+			return grant.IsReady()
+		}, testTimeout, testInterval).Should(BeTrue())
+	})
+
+	// A logical backup takes a read lock and dumps the database through the same Pods. It never completes against a
+	// stalled primary.
+	It("should complete a logical backup", func() {
+		backupKey := types.NamespacedName{
+			Name:      "mariadb-repl-semi-sync-backup",
+			Namespace: testNamespace,
+		}
+		backup := getBackupWithPVCStorage(backupKey)
+		backup.Spec.MariaDBRef.Name = key.Name
+
+		By("Creating Backup")
+		Expect(k8sClient.Create(testCtx, backup)).To(Succeed())
+		DeferCleanup(func() {
+			Expect(k8sClient.Delete(testCtx, backup)).To(Succeed())
+		})
+
+		By("Expecting Backup to complete eventually")
+		Eventually(func(g Gomega) bool {
+			g.Expect(k8sClient.Get(testCtx, backupKey, backup)).To(Succeed())
+			return backup.IsComplete()
+		}, testHighTimeout, testInterval).Should(BeTrue())
+
+		expectSemiSyncTopology(mdb, primaryPodIndex())
+	})
+
+	It("should complete a logical backup and restore with S3 storage", func() {
+		backupKey := types.NamespacedName{
+			Name:      "mariadb-repl-semi-sync-backup-s3",
+			Namespace: testNamespace,
+		}
+		backup := getBackupWithS3Storage(backupKey, testSemiSyncBucket, "")
+		backup.Spec.MariaDBRef.Name = key.Name
+
+		By("Creating Backup")
+		Expect(k8sClient.Create(testCtx, backup)).To(Succeed())
+		DeferCleanup(func() {
+			Expect(k8sClient.Delete(testCtx, backup)).To(Succeed())
+		})
+
+		By("Expecting Backup to complete eventually")
+		Eventually(func(g Gomega) bool {
+			g.Expect(k8sClient.Get(testCtx, backupKey, backup)).To(Succeed())
+			return backup.IsComplete()
+		}, testHighTimeout, testInterval).Should(BeTrue())
+
+		restoreKey := types.NamespacedName{
+			Name:      "mariadb-repl-semi-sync-restore-s3",
+			Namespace: testNamespace,
+		}
+		restore := mariadbv1alpha1.Restore{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      restoreKey.Name,
+				Namespace: restoreKey.Namespace,
+			},
+			Spec: mariadbv1alpha1.RestoreSpec{
+				MariaDBRef: mariadbv1alpha1.MariaDBRef{
+					ObjectReference: mariadbv1alpha1.ObjectReference{
+						Name: key.Name,
+					},
+					WaitForIt: true,
+				},
+				RestoreSource: mariadbv1alpha1.RestoreSource{
+					S3: getS3Storage(testSemiSyncBucket, ""),
+				},
+			},
+		}
+
+		By("Creating Restore")
+		Expect(k8sClient.Create(testCtx, &restore)).To(Succeed())
+		DeferCleanup(func() {
+			Expect(k8sClient.Delete(testCtx, &restore)).To(Succeed())
+		})
+
+		By("Expecting Restore to complete eventually")
+		Eventually(func(g Gomega) bool {
+			g.Expect(k8sClient.Get(testCtx, restoreKey, &restore)).To(Succeed())
+			return restore.IsComplete()
+		}, testHighTimeout, testInterval).Should(BeTrue())
+
+		primary := primaryPodIndex()
+		expectSemiSyncTopology(mdb, primary)
+		expectSemiSyncPrimaryAcknowledged(mdb, primary)
+		expectSemiSyncWriteNotStalled(mdb, primary)
+	})
+
+	// A Pod always boots with rpl_semi_sync_master_enabled=OFF, since that is what the configuration file renders.
+	// A restarted replica must therefore come back disarmed without the operator having to do anything, and the
+	// primary must stay armed throughout.
+	It("should keep semi-sync consistent across a replica restart", func() {
+		primary := primaryPodIndex()
+		var replica int
+		for i := 0; i < int(mdb.Spec.Replicas); i++ {
+			if i != primary {
+				replica = i
+				break
+			}
+		}
+
+		By(fmt.Sprintf("Tearing down replica Pod '%d'", replica))
+		deletePodByIndex(mdb, replica)
+
+		By("Expecting MariaDB to be ready eventually")
+		Eventually(func(g Gomega) bool {
+			g.Expect(k8sClient.Get(testCtx, key, mdb)).To(Succeed())
+			return mdb.IsReady()
+		}, testHighTimeout, testInterval).MustPassRepeatedly(10).Should(BeTrue())
+
+		expectSemiSyncTopology(mdb, primaryPodIndex())
+		expectSemiSyncPrimaryAcknowledged(mdb, primaryPodIndex())
+		expectSemiSyncWriteNotStalled(mdb, primaryPodIndex())
+	})
+
+	// Switchover arms the promoted node and disarms the demoted one. Switching back exercises the reverse transition
+	// on nodes that already served as primary.
+	It("should move semi-sync on switchover", func() {
+		originalPrimary := primaryPodIndex()
+		var newPrimary int
+		for i := 0; i < int(mdb.Spec.Replicas); i++ {
+			if i != originalPrimary {
+				newPrimary = i
+				break
+			}
+		}
+
+		switchPrimaryTo := func(podIndex int) {
+			By(fmt.Sprintf("Expecting MariaDB to eventually update primary to index '%d'", podIndex))
+			Eventually(func(g Gomega) bool {
+				g.Expect(k8sClient.Get(testCtx, key, mdb)).To(Succeed())
+				mdb.Spec.Replication.Primary.PodIndex = ptr.To(podIndex)
+				g.Expect(k8sClient.Update(testCtx, mdb)).To(Succeed())
+				return true
+			}, testTimeout, testInterval).Should(BeTrue())
+
+			By(fmt.Sprintf("Expecting MariaDB to eventually change primary to index '%d'", podIndex))
+			Eventually(func(g Gomega) bool {
+				g.Expect(k8sClient.Get(testCtx, key, mdb)).To(Succeed())
+				return mdb.IsReady() && mdb.Status.CurrentPrimaryPodIndex != nil && *mdb.Status.CurrentPrimaryPodIndex == podIndex
+			}, testHighTimeout, testInterval).Should(BeTrue())
+
+			expectSemiSyncTopology(mdb, podIndex)
+			expectSemiSyncPrimaryAcknowledged(mdb, podIndex)
+			expectSemiSyncWriteNotStalled(mdb, podIndex)
+			expectReplicationConnectionsReady(mdb)
+		}
+
+		switchPrimaryTo(newPrimary)
+		switchPrimaryTo(originalPrimary)
+	})
+
+	// Failover promotes a replica without the demoted primary taking part: the promoted node must end up armed, and
+	// the old primary must come back as a disarmed replica once its Pod is recreated.
+	It("should move semi-sync on failover", func() {
+		originalPrimary := primaryPodIndex()
+
+		By(fmt.Sprintf("Tearing down primary Pod '%d'", originalPrimary))
+		deletePodByIndex(mdb, originalPrimary)
+
+		By("Expecting MariaDB to eventually change primary")
+		Eventually(func(g Gomega) bool {
+			g.Expect(k8sClient.Get(testCtx, key, mdb)).To(Succeed())
+			if !mdb.IsReady() || mdb.Status.CurrentPrimaryPodIndex == nil {
+				return false
+			}
+			return *mdb.Status.CurrentPrimaryPodIndex != originalPrimary
+		}, testHighTimeout, testInterval).Should(BeTrue())
+
+		By("Expecting MariaDB to be ready eventually")
+		Eventually(func(g Gomega) bool {
+			g.Expect(k8sClient.Get(testCtx, key, mdb)).To(Succeed())
+			return mdb.IsReady()
+		}, testHighTimeout, testInterval).MustPassRepeatedly(10).Should(BeTrue())
+
+		newPrimary := primaryPodIndex()
+		Expect(newPrimary).ToNot(Equal(originalPrimary))
+
+		expectSemiSyncTopology(mdb, newPrimary)
+		expectSemiSyncPrimaryAcknowledged(mdb, newPrimary)
+		expectSemiSyncWriteNotStalled(mdb, newPrimary)
+		expectReplicationConnectionsReady(mdb)
+	})
+
+	// A rolling update restarts every Pod, and with the default 'ReplicasFirstPrimaryLast' strategy it switches the primary
+	// over before restarting it. Every restarted Pod boots unarmed, so the primary must end up armed and acknowledged,
+	// and the replicas disarmed, once the update completes. The primary must never accept writes unarmed in the meantime.
+	It("should keep semi-sync consistent across a rolling update", func() {
+		previousRevision := statefulSetUpdateRevision(key)
+
+		stopSampling := sampleSemiSyncWritablePrimary(mdb)
+		DeferCleanup(stopSampling)
+		testMariadbUpdate(mdb)
+		expectStatefulSetRolledOut(mdb, previousRevision)
+
+		Expect(stopSampling()).To(BeEmpty(), "The primary accepted writes with semi-sync disabled during the rolling update.")
+
+		By("Expecting MariaDB to be ready eventually")
+		Eventually(func(g Gomega) bool {
+			g.Expect(k8sClient.Get(testCtx, key, mdb)).To(Succeed())
+			return mdb.IsReady()
+		}, testHighTimeout, testInterval).MustPassRepeatedly(10).Should(BeTrue())
+
+		primary := primaryPodIndex()
+		expectSemiSyncTopology(mdb, primary)
+		expectSemiSyncPrimaryAcknowledged(mdb, primary)
+		expectSemiSyncWriteNotStalled(mdb, primary)
+		expectReplicationConnectionsReady(mdb)
+	})
+
+	// Rotating the root password runs ALTER USER in the primary, which is binlogged and therefore waits for a
+	// semi-synchronous acknowledgement: against a wrongly armed primary it never returns, and the rotation never
+	// completes. It is also the one flow where the operator cannot authenticate for a while, because
+	// 'spec.rootPasswordSecretKeyRef' already holds the new password while the servers still have the old one until the
+	// 'Root Password' phase runs, so it exercises how the semi-sync reconciliation behaves against unreachable Pods.
+	//
+	// It runs last in this Ordered container because it leaves the MariaDB with a different root password.
+	It("should rotate the root password", func() {
+		By("Expecting the root password hash to be set")
+		var previousHash string
+		Eventually(func(g Gomega) bool {
+			g.Expect(k8sClient.Get(testCtx, key, mdb)).To(Succeed())
+			if mdb.Status.RootPasswordHash == nil {
+				return false
+			}
+			previousHash = *mdb.Status.RootPasswordHash
+			return true
+		}, testHighTimeout, testInterval).Should(BeTrue())
+
+		By("Rotating the root password Secret")
+		Eventually(func(g Gomega) {
+			var secret corev1.Secret
+			g.Expect(k8sClient.Get(testCtx, rootPwdKey, &secret)).To(Succeed())
+			secret.Data[testPwdSecretKey] = []byte(testSemiSyncRootPasswordRotated)
+			g.Expect(k8sClient.Update(testCtx, &secret)).To(Succeed())
+		}, testTimeout, testInterval).Should(Succeed())
+
+		By("Expecting the root password hash to change eventually")
+		Eventually(func(g Gomega) bool {
+			g.Expect(k8sClient.Get(testCtx, key, mdb)).To(Succeed())
+			return mdb.Status.RootPasswordHash != nil && *mdb.Status.RootPasswordHash != previousHash
+		}, testHighTimeout, testInterval).Should(BeTrue())
+
+		By("Expecting MariaDB to be ready eventually")
+		Eventually(func(g Gomega) bool {
+			g.Expect(k8sClient.Get(testCtx, key, mdb)).To(Succeed())
+			return mdb.IsReady()
+		}, testHighTimeout, testInterval).MustPassRepeatedly(10).Should(BeTrue())
+
+		// 'sql.Connect' pings on connect, so building a client is itself the assertion that the rotated password is the
+		// one the server now accepts: the clients resolve 'spec.rootPasswordSecretKeyRef', which holds the new value.
+		By("Expecting to connect to every Pod with the rotated root password")
+		Eventually(func(g Gomega) bool {
+			for i := 0; i < int(mdb.Spec.Replicas); i++ {
+				withSemiSyncSqlClient(g, mdb, i, func(client *sql.Client) {})
+			}
+			return true
+		}, testHighTimeout, testInterval).Should(BeTrue())
+
+		primary := primaryPodIndex()
+		expectSemiSyncTopology(mdb, primary)
+		expectSemiSyncPrimaryAcknowledged(mdb, primary)
+		expectSemiSyncWriteNotStalled(mdb, primary)
+		expectReplicationConnectionsReady(mdb)
+	})
+})
+
+// A MaxScale switchover promotes a replica without arming it, and the rolling update does not reach the Replication phase
+// until every Pod has been rolled, so the operator must arm the new primary before it rolls the demoted one.
+var _ = Describe("MariaDB replication semi-sync with MaxScale", Ordered, func() {
+	var (
+		key = types.NamespacedName{
+			Name:      "mariadb-repl",
+			Namespace: testNamespace,
+		}
+		mdb *mariadbv1alpha1.MariaDB
+	)
+
+	BeforeAll(func() {
+		mdb = buildTestMariaDBWithRepl(key)
+		applyMariadbTestConfig(mdb)
+		applySemiSyncTestConfig(mdb)
+
+		By("Creating MariaDB with replication")
+		Expect(k8sClient.Create(testCtx, mdb)).To(Succeed())
+		DeferCleanup(func() {
+			deleteMariadb(key, false)
+		})
+
+		By("Expecting MariaDB to be ready eventually")
+		Eventually(func(g Gomega) bool {
+			g.Expect(k8sClient.Get(testCtx, key, mdb)).To(Succeed())
+			return mdb.IsReady()
+		}, testHighTimeout, testInterval).Should(BeTrue())
+
+		mxs := &mariadbv1alpha1.MaxScale{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "maxscale-repl",
+				Namespace: testNamespace,
+			},
+			Spec: mariadbv1alpha1.MaxScaleSpec{
+				Replicas: 2,
+				KubernetesService: &mariadbv1alpha1.ServiceTemplate{
+					Type: corev1.ServiceTypeLoadBalancer,
+					Metadata: &mariadbv1alpha1.Metadata{
+						Annotations: map[string]string{
+							"metallb.io/loadBalancerIPs": testCidrPrefix + ".0.214",
+						},
+					},
+				},
+				GuiKubernetesService: &mariadbv1alpha1.ServiceTemplate{
+					Type: corev1.ServiceTypeLoadBalancer,
+					Metadata: &mariadbv1alpha1.Metadata{
+						Annotations: map[string]string{
+							"metallb.io/loadBalancerIPs": testCidrPrefix + ".0.230",
+						},
+					},
+				},
+				// 'testMaxscale' expects a ready Connection, which is only created when this is set.
+				Connection: &mariadbv1alpha1.ConnectionTemplate{
+					SecretName: ptr.To("mxs-repl-conn"),
+					HealthCheck: &mariadbv1alpha1.HealthCheck{
+						Interval: ptr.To(metav1.Duration{Duration: 1 * time.Second}),
+					},
+				},
+				Auth: mariadbv1alpha1.MaxScaleAuth{
+					Generate: ptr.To(true),
+					AdminPasswordSecretKeyRef: mariadbv1alpha1.GeneratedSecretKeyRef{
+						SecretKeySelector: mariadbv1alpha1.SecretKeySelector{
+							LocalObjectReference: mariadbv1alpha1.LocalObjectReference{
+								Name: testPwdKey.Name,
+							},
+							Key: testPwdSecretKey,
+						},
+						Generate: false,
+					},
+				},
+				TLS: &mariadbv1alpha1.MaxScaleTLS{
+					Enabled:               true,
+					VerifyPeerCertificate: ptr.To(true),
+					VerifyPeerHost:        ptr.To(false),
+					ReplicationSSLEnabled: ptr.To(true),
+				},
+			},
+		}
+		testMaxscale(mdb, mxs)
+	})
+
+	It("should arm the new primary before rolling the demoted primary", func() {
+		Expect(k8sClient.Get(testCtx, key, mdb)).To(Succeed())
+		Expect(mdb.Status.CurrentPrimaryPodIndex).NotTo(BeNil())
+		oldPrimary := *mdb.Status.CurrentPrimaryPodIndex
+		oldPrimaryKey := types.NamespacedName{
+			Name:      statefulset.PodName(mdb.ObjectMeta, oldPrimary),
+			Namespace: mdb.Namespace,
+		}
+		var oldPrimaryPod corev1.Pod
+		Expect(k8sClient.Get(testCtx, oldPrimaryKey, &oldPrimaryPod)).To(Succeed())
+		previousRevision := statefulSetUpdateRevision(key)
+
+		By("Triggering a rolling update")
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Get(testCtx, key, mdb)).To(Succeed())
+			if mdb.Spec.PodMetadata == nil {
+				mdb.Spec.PodMetadata = &mariadbv1alpha1.Metadata{}
+			}
+			if mdb.Spec.PodMetadata.Annotations == nil {
+				mdb.Spec.PodMetadata.Annotations = map[string]string{}
+			}
+			mdb.Spec.PodMetadata.Annotations["k8s.mariadb.com/updated-at"] = time.Now().String()
+			g.Expect(k8sClient.Update(testCtx, mdb)).To(Succeed())
+		}, testTimeout, testInterval).Should(Succeed())
+
+		// Polled faster than testInterval, so that the check below runs right after the deletion.
+		By("Expecting the demoted primary Pod to be rolled eventually")
+		Eventually(func(g Gomega) bool {
+			var pod corev1.Pod
+			if err := k8sClient.Get(testCtx, oldPrimaryKey, &pod); err != nil {
+				return apierrors.IsNotFound(err)
+			}
+			return pod.UID != oldPrimaryPod.UID || pod.DeletionTimestamp != nil
+		}, testHighTimeout, 250*time.Millisecond).Should(BeTrue())
+
+		Expect(k8sClient.Get(testCtx, key, mdb)).To(Succeed())
+		Expect(mdb.Status.CurrentPrimaryPodIndex).NotTo(BeNil())
+		newPrimary := *mdb.Status.CurrentPrimaryPodIndex
+		Expect(newPrimary).NotTo(Equal(oldPrimary))
+
+		By(fmt.Sprintf("Expecting the new primary in Pod '%d' to be armed", newPrimary))
+		withSemiSyncSqlClient(Default, mdb, newPrimary, func(client *sql.Client) {
+			enabled, err := client.IsSemiSyncMasterEnabled(testCtx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(enabled).To(BeTrue(), "The new primary was not armed when the demoted primary was rolled.")
+		})
+
+		expectStatefulSetRolledOut(mdb, previousRevision)
+
+		By("Expecting MariaDB to be ready eventually")
+		Eventually(func(g Gomega) bool {
+			g.Expect(k8sClient.Get(testCtx, key, mdb)).To(Succeed())
+			return mdb.IsReady()
+		}, testHighTimeout, testInterval).MustPassRepeatedly(10).Should(BeTrue())
+
+		expectSemiSyncTopology(mdb, newPrimary)
+		expectSemiSyncPrimaryAcknowledged(mdb, newPrimary)
+		expectSemiSyncWriteNotStalled(mdb, newPrimary)
+	})
+})
+
+// withSemiSyncSqlClient runs fn against a SQL client connected to a given Pod. Pass the Gomega instance provided by
+// Eventually when polling, or Default when asserting once.
+func withSemiSyncSqlClient(g Gomega, mdb *mariadbv1alpha1.MariaDB, podIndex int, fn func(client *sql.Client)) {
+	clientSet := sql.NewClientSet(mdb, testRefResolver)
+	defer clientSet.Close()
+
+	client, err := clientSet.ClientForIndex(testCtx, podIndex)
+	g.Expect(err).ToNot(HaveOccurred(), fmt.Sprintf("Could not create a client for Pod '%d'.", podIndex))
+
+	fn(client)
+}
+
+// sampleSemiSyncWritablePrimary samples the Pod at 'status.currentPrimaryPodIndex' until the returned function is called,
+// and records every sample where it is writable while primary-side semi-sync is disabled. Samples where the Pod cannot be
+// reached are ignored, as they are expected while it is being rolled. The returned function stops sampling and returns
+// the recorded violations.
+func sampleSemiSyncWritablePrimary(mdb *mariadbv1alpha1.MariaDB) func() []string {
+	key := client.ObjectKeyFromObject(mdb)
+	done := make(chan struct{})
+	result := make(chan []string, 1)
+
+	sample := func() (string, bool) {
+		var sampled mariadbv1alpha1.MariaDB
+		if err := k8sClient.Get(testCtx, key, &sampled); err != nil || sampled.Status.CurrentPrimaryPodIndex == nil {
+			return "", false
+		}
+		podIndex := *sampled.Status.CurrentPrimaryPodIndex
+
+		clientSet := sql.NewClientSet(&sampled, testRefResolver)
+		defer clientSet.Close()
+		client, err := clientSet.ClientForIndex(testCtx, podIndex)
+		if err != nil {
+			return "", false
+		}
+		readOnly, err := client.IsSystemVariableEnabled(testCtx, "read_only")
+		if err != nil || readOnly {
+			return "", false
+		}
+		enabled, err := client.IsSemiSyncMasterEnabled(testCtx)
+		if err != nil || enabled {
+			return "", false
+		}
+		return fmt.Sprintf("%s: Pod '%d' writable with semi-sync disabled", time.Now().Format(time.RFC3339), podIndex), true
+	}
+
+	go func() {
+		defer GinkgoRecover()
+		var violations []string
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				result <- violations
+				return
+			case <-ticker.C:
+				if violation, ok := sample(); ok {
+					violations = append(violations, violation)
+				}
+			}
+		}
+	}()
+
+	var once sync.Once
+	var violations []string
+	return func() []string {
+		once.Do(func() {
+			close(done)
+			violations = <-result
+		})
+		return violations
+	}
+}
+
+// statefulSetUpdateRevision returns the current 'status.updateRevision' of the MariaDB StatefulSet.
+func statefulSetUpdateRevision(key types.NamespacedName) string {
+	var sts appsv1.StatefulSet
+	Expect(k8sClient.Get(testCtx, key, &sts)).To(Succeed())
+	return sts.Status.UpdateRevision
+}
+
+// expectStatefulSetRolledOut waits for every Pod to be rolled to a revision newer than previousRevision. The Updated
+// condition may still be the one from before the update when 'testMariadbUpdate' checks it, and the update would
+// otherwise keep going during the next spec.
+func expectStatefulSetRolledOut(mdb *mariadbv1alpha1.MariaDB, previousRevision string) {
+	By("Expecting all Pods to be updated eventually")
+	Eventually(func(g Gomega) bool {
+		var sts appsv1.StatefulSet
+		g.Expect(k8sClient.Get(testCtx, client.ObjectKeyFromObject(mdb), &sts)).To(Succeed())
+		return sts.Status.ObservedGeneration == sts.Generation &&
+			sts.Status.UpdateRevision != previousRevision &&
+			sts.Status.UpdatedReplicas == mdb.Spec.Replicas &&
+			sts.Status.ReadyReplicas == mdb.Spec.Replicas
+	}, testHighTimeout, testInterval).Should(BeTrue())
+}
+
+// applySemiSyncTestConfig enables semi-sync with the settings that turn a wrongly armed node into a stalled one.
+func applySemiSyncTestConfig(mdb *mariadbv1alpha1.MariaDB) {
+	mdb.Spec.Replication.SemiSyncEnabled = ptr.To(true)
+	mdb.Spec.Replication.SemiSyncAckTimeout = &metav1.Duration{Duration: testSemiSyncAckTimeout}
+	// The server default, set explicitly: it is what makes a node armed with no replicas stall its writes.
+	mdb.Spec.Replication.SemiSyncWaitNoSlave = ptr.To(true)
+	// Boot unarmed and read_only, so a node is never writable while it is unable to require an acknowledgement.
+	mdb.Spec.Replication.SemiSyncBootAsReplica = ptr.To(true)
+}
+
+// expectSemiSyncTopology asserts that primary-side semi-sync converges to the role of every Pod: enabled in the
+// primary and disabled in the replicas. Replica-side semi-sync is rendered in the configuration file and must stay
+// enabled everywhere, so that any node can be promoted and acknowledge without reconfiguration.
+func expectSemiSyncTopology(mdb *mariadbv1alpha1.MariaDB, primaryPodIndex int) {
+	By(fmt.Sprintf("Expecting primary-side semi-sync to be enabled in Pod '%d' only", primaryPodIndex))
+	Eventually(func(g Gomega) bool {
+		for i := 0; i < int(mdb.Spec.Replicas); i++ {
+			shouldBeEnabled := i == primaryPodIndex
+
+			withSemiSyncSqlClient(g, mdb, i, func(client *sql.Client) {
+				masterEnabled, err := client.IsSemiSyncMasterEnabled(testCtx)
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(masterEnabled).To(Equal(shouldBeEnabled),
+					fmt.Sprintf("Unexpected rpl_semi_sync_master_enabled in Pod '%d'.", i))
+
+				slaveEnabled, err := client.IsSystemVariableEnabled(testCtx, "rpl_semi_sync_slave_enabled")
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(slaveEnabled).To(BeTrue(),
+					fmt.Sprintf("Unexpected rpl_semi_sync_slave_enabled in Pod '%d'.", i))
+			})
+		}
+		return true
+	}, testHighTimeout, testInterval).Should(BeTrue())
+}
+
+// expectSemiSyncPrimaryAcknowledged asserts that the primary is armed and that every replica is connected to it as a
+// semi-synchronous acknowledger. Without this, semi-sync could be reported as enabled while no replica can ever
+// acknowledge, which is the stall this feature prevents.
+func expectSemiSyncPrimaryAcknowledged(mdb *mariadbv1alpha1.MariaDB, primaryPodIndex int) {
+	By(fmt.Sprintf("Expecting the primary in Pod '%d' to be acknowledged by all its replicas", primaryPodIndex))
+	Eventually(func(g Gomega) bool {
+		var status string
+		var clients int
+
+		withSemiSyncSqlClient(g, mdb, primaryPodIndex, func(client *sql.Client) {
+			var err error
+			status, err = client.StatusVariable(testCtx, "Rpl_semi_sync_master_status")
+			g.Expect(err).ToNot(HaveOccurred())
+
+			clients, err = client.StatusVariableInt(testCtx, "Rpl_semi_sync_master_clients")
+			g.Expect(err).ToNot(HaveOccurred())
+		})
+		return status == "ON" && clients == int(mdb.Spec.Replicas)-1
+	}, testHighTimeout, testInterval).Should(BeTrue())
+}
+
+// expectSemiSyncWriteNotStalled runs binlogged writes in the primary and asserts that they were acknowledged by a
+// replica rather than left waiting for the whole ACK timeout. Both signals matter: the elapsed time catches a stall,
+// and the counters catch writes that completed only because the ACK timeout expired and semi-sync fell back to
+// asynchronous.
+func expectSemiSyncWriteNotStalled(mdb *mariadbv1alpha1.MariaDB, primaryPodIndex int) {
+	table := fmt.Sprintf("semi_sync_probe_%d", time.Now().UnixNano())
+	yesTxBefore, noTxBefore := getSemiSyncTxCounters(mdb, primaryPodIndex)
+
+	By(fmt.Sprintf("Expecting binlogged writes in Pod '%d' to complete without stalling", primaryPodIndex))
+	start := time.Now()
+	executeSqlInPodByIndex(mdb, primaryPodIndex,
+		fmt.Sprintf("CREATE TABLE `%s`.`%s` (id INT PRIMARY KEY);", testDatabase, table))
+	executeSqlInPodByIndex(mdb, primaryPodIndex,
+		fmt.Sprintf("INSERT INTO `%s`.`%s` (id) VALUES (1);", testDatabase, table))
+	executeSqlInPodByIndex(mdb, primaryPodIndex,
+		fmt.Sprintf("DROP TABLE `%s`.`%s`;", testDatabase, table))
+	elapsed := time.Since(start)
+
+	Expect(elapsed).To(BeNumerically("<", testSemiSyncWriteBudget),
+		fmt.Sprintf("Binlogged writes in Pod '%d' took %s, they are waiting for an acknowledgement.", primaryPodIndex, elapsed))
+
+	yesTxAfter, noTxAfter := getSemiSyncTxCounters(mdb, primaryPodIndex)
+	Expect(yesTxAfter).To(BeNumerically(">", yesTxBefore),
+		"Transactions were not acknowledged by any replica.")
+	Expect(noTxAfter).To(Equal(noTxBefore),
+		"Transactions completed without an acknowledgement.")
+}
+
+func getSemiSyncTxCounters(mdb *mariadbv1alpha1.MariaDB, podIndex int) (yesTx, noTx int) {
+	withSemiSyncSqlClient(Default, mdb, podIndex, func(client *sql.Client) {
+		var err error
+		yesTx, err = client.StatusVariableInt(testCtx, "Rpl_semi_sync_master_yes_tx")
+		Expect(err).ToNot(HaveOccurred())
+
+		noTx, err = client.StatusVariableInt(testCtx, "Rpl_semi_sync_master_no_tx")
+		Expect(err).ToNot(HaveOccurred())
+	})
+	return yesTx, noTx
+}
+
+func expectReplicationConnectionsReady(mdb *mariadbv1alpha1.MariaDB) {
+	connKeys := []types.NamespacedName{
+		{
+			Name:      mdb.Name,
+			Namespace: mdb.Namespace,
+		},
+		mdb.PrimaryConnectioneKey(),
+		mdb.SecondaryConnectioneKey(),
+	}
+
+	for _, connKey := range connKeys {
+		By(fmt.Sprintf("Expecting Connection '%s' to be ready eventually", connKey.Name))
+		Eventually(func(g Gomega) bool {
+			var conn mariadbv1alpha1.Connection
+			g.Expect(k8sClient.Get(testCtx, connKey, &conn)).To(Succeed())
+			return conn.IsReady()
+		}, testTimeout, testInterval).Should(BeTrue())
+	}
+}

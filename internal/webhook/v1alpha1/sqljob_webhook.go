@@ -1,0 +1,87 @@
+package v1alpha1
+
+import (
+	"context"
+	"fmt"
+
+	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	ctrl "sigs.k8s.io/controller-runtime"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+)
+
+// log is for logging in this package.
+var sqljoblog = logf.Log.WithName("sqljob-resource")
+
+// SetupSqlJobWebhookWithManager registers the webhook for SqlJob in the manager.
+func SetupSqlJobWebhookWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewWebhookManagedBy(mgr, &mariadbv1alpha1.SqlJob{}).
+		WithValidator(&SqlJobCustomValidator{}).
+		Complete()
+}
+
+// +kubebuilder:webhook:path=/validate-k8s-mariadb-com-v1alpha1-sqljob,mutating=false,failurePolicy=fail,sideEffects=None,groups=k8s.mariadb.com,resources=sqljobs,verbs=create;update,versions=v1alpha1,name=vsqljob-v1alpha1.kb.io,admissionReviewVersions=v1
+
+// SqlJobCustomValidator struct is responsible for validating the SqlJob resource
+// when it is created, updated, or deleted.
+type SqlJobCustomValidator struct{}
+
+var _ admission.Validator[*mariadbv1alpha1.SqlJob] = &SqlJobCustomValidator{}
+
+// ValidateCreate implements webhook.CustomValidator so a webhook will be registered for the type SqlJob.
+func (v *SqlJobCustomValidator) ValidateCreate(ctx context.Context, sqljob *mariadbv1alpha1.SqlJob) (admission.Warnings, error) {
+	sqljoblog.V(1).Info("Validation for SqlJob upon creation", "name", sqljob.GetName())
+
+	return validateSqlJob(sqljob)
+}
+
+// ValidateUpdate implements webhook.CustomValidator so a webhook will be registered for the type SqlJob.
+func (v *SqlJobCustomValidator) ValidateUpdate(ctx context.Context, oldSqljob, sqljob *mariadbv1alpha1.SqlJob) (admission.Warnings, error) {
+	sqljoblog.V(1).Info("Validation for SqlJob upon update", "name", sqljob.GetName())
+
+	if err := immutableWebhook.ValidateUpdate(sqljob, oldSqljob); err != nil {
+		return nil, err
+	}
+	return validateSqlJob(sqljob)
+}
+
+// ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type SqlJob.
+func (v *SqlJobCustomValidator) ValidateDelete(ctx context.Context, sqljob *mariadbv1alpha1.SqlJob) (admission.Warnings, error) {
+	return nil, nil
+}
+
+func validateSqlJob(sqlJob *mariadbv1alpha1.SqlJob) (admission.Warnings, error) {
+	if err := validateSql(sqlJob); err != nil {
+		return nil, err
+	}
+	if err := validateSqlJobSchedule(sqlJob); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func validateSql(sqlJob *mariadbv1alpha1.SqlJob) error {
+	if sqlJob.Spec.Sql == nil && sqlJob.Spec.SqlConfigMapKeyRef == nil {
+		return field.Invalid(
+			field.NewPath("spec"),
+			sqlJob.Spec,
+			"either `spec.sql` or `sql.sqlConfigMapKeyRef` must be set",
+		)
+	}
+	return nil
+}
+
+func validateSqlJobSchedule(sqlJob *mariadbv1alpha1.SqlJob) error {
+	if sqlJob.Spec.Schedule == nil {
+		return nil
+	}
+	if err := sqlJob.Spec.Schedule.Validate(); err != nil {
+		return field.Invalid(
+			field.NewPath("spec").Child("schedule"),
+			sqlJob.Spec.Schedule,
+			fmt.Sprintf("invalid schedule: %v", err),
+		)
+	}
+	return nil
+}

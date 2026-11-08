@@ -1,0 +1,36 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: sysbench-repl
+spec:
+  concurrencyPolicy: Forbid
+  schedule: "*/5 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: sysbench-prepare
+            image: severalnines/sysbench
+            command:
+              - sysbench
+              - oltp_read_write
+              - --tables=5
+              - --table_size=1000000
+              - --mysql-host=mariadb-repl-primary.default.svc.cluster.local
+              # - --mysql-host=maxscale-repl.default.svc.cluster.local
+              - --mysql-port=3306
+              - --mysql-user=sbtest-repl
+              - --mysql-password=MariaDB11!
+              - --mysql-db=sbtest-repl
+              - --time=300 
+              - --threads=1
+              - --report-interval=1
+              - run
+            resources:
+              requests:
+                cpu: 500m
+                memory: 128Mi
+              limits:
+                memory: 512Mi

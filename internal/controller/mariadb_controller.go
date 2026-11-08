@@ -1,0 +1,1270 @@
+package controller
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"text/template"
+	"time"
+
+	"github.com/hashicorp/go-multierror"
+	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
+	agentresources "github.com/mariadb-operator/mariadb-operator/v26/pkg/agent/resources"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/backup"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/builder"
+	labels "github.com/mariadb-operator/mariadb-operator/v26/pkg/builder/labels"
+	condition "github.com/mariadb-operator/mariadb-operator/v26/pkg/condition"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/auth"
+	certctrl "github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/certificate"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/configmap"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/deployment"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/endpoints"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/galera"
+	galeraresources "github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/galera/resources"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/maintenance"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/pvc"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/rbac"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/replication"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/secret"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/service"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/servicemonitor"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/statefulset"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/discovery"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/environment"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/health"
+	kadapter "github.com/mariadb-operator/mariadb-operator/v26/pkg/kubernetes/adapter"
+	mdbpod "github.com/mariadb-operator/mariadb-operator/v26/pkg/pod"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/refresolver"
+	sts "github.com/mariadb-operator/mariadb-operator/v26/pkg/statefulset"
+	mdbsnapshot "github.com/mariadb-operator/mariadb-operator/v26/pkg/volumesnapshot"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/events"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+var (
+	ErrSkipReconciliationPhase = errors.New("skipping reconciliation phase")
+)
+
+// MariaDBReconciler reconciles a MariaDB object
+type MariaDBReconciler struct {
+	client.Client
+	Scheme   *runtime.Scheme
+	Recorder events.EventRecorder
+
+	Builder         *builder.Builder
+	RefResolver     *refresolver.RefResolver
+	ConditionReady  *condition.Ready
+	Environment     *environment.OperatorEnv
+	Discovery       *discovery.Discovery
+	BackupProcessor backup.BackupProcessor
+	TopologyManager *replication.TopologyManager
+
+	ConfigMapReconciler      *configmap.ConfigMapReconciler
+	SecretReconciler         *secret.SecretReconciler
+	StatefulSetReconciler    *statefulset.StatefulSetReconciler
+	ServiceReconciler        *service.ServiceReconciler
+	EndpointsReconciler      *endpoints.EndpointsReconciler
+	RBACReconciler           *rbac.RBACReconciler
+	AuthReconciler           *auth.AuthReconciler
+	DeploymentReconciler     *deployment.DeploymentReconciler
+	PVCReconciler            *pvc.PVCReconciler
+	ServiceMonitorReconciler *servicemonitor.ServiceMonitorReconciler
+	CertReconciler           *certctrl.CertReconciler
+
+	ReplicationReconciler *replication.ReplicationReconciler
+	GaleraReconciler      *galera.GaleraReconciler
+	MaintenanceReconciler *maintenance.MaintenanceReconciler
+}
+
+type reconcilePhaseMariaDB struct {
+	Name      string
+	Reconcile func(context.Context, *mariadbv1alpha1.MariaDB) (ctrl.Result, error)
+}
+
+type patcherMariaDB func(*mariadbv1alpha1.MariaDBStatus) error
+
+//+kubebuilder:rbac:groups=k8s.mariadb.com,resources=mariadbs,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=k8s.mariadb.com,resources=mariadbs/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=k8s.mariadb.com,resources=mariadbs/finalizers,verbs=update
+//+kubebuilder:rbac:groups=k8s.mariadb.com,resources=maxscale;restores;connections;users;grants;physicalbackups,verbs=list;watch;create;patch
+//+kubebuilder:rbac:groups=k8s.mariadb.com,resources=pointintimerecoveries,verbs=list;watch;get
+//+kubebuilder:rbac:groups=k8s.mariadb.com,resources=pointintimerecoveries/status,verbs=get;patch;update
+//+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;patch;delete
+//+kubebuilder:rbac:groups="",resources=services,verbs=list;watch;create;patch
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=list;watch;create;patch
+//+kubebuilder:rbac:groups="",resources=pods,verbs=get;patch;delete
+//+kubebuilder:rbac:groups="",resources=pods/log,verbs=get
+//+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=list;delete
+//+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=list;watch;create;patch
+//+kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=list;watch;create;patch;delete
+//+kubebuilder:rbac:groups=apps,resources=deployments,verbs=list;watch;create;patch
+//+kubebuilder:rbac:groups=batch,resources=jobs,verbs=list;watch;create;patch;delete
+//+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=list;watch;create;patch
+//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings;clusterrolebindings,verbs=list;watch;create;patch
+//+kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
+//+kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
+//+kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=create;patch;get;list;watch
+//+kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices/restricted,verbs=create;patch;get;list;watch
+//+kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=list;watch;create;patch
+//+kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=list;watch;create;patch
+//+kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=list;watch;create;patch
+
+// Reconcile is part of the main kubernetes reconciliation loop which aims to
+// move the current state of the cluster closer to the desired state.
+func (r *MariaDBReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithName("mariadb")
+	var mariadb mariadbv1alpha1.MariaDB
+	if err := r.Get(ctx, req.NamespacedName, &mariadb); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	phases := []reconcilePhaseMariaDB{
+		{
+			Name:      "Spec",
+			Reconcile: r.setSpecDefaults,
+		},
+		{
+			Name:      "Status",
+			Reconcile: r.reconcileStatus,
+		},
+		{
+			Name:      "Suspend",
+			Reconcile: r.reconcileSuspend,
+		},
+		{
+			Name:      "Secret",
+			Reconcile: r.reconcileSecret,
+		},
+		{
+			Name:      "ConfigMap",
+			Reconcile: r.reconcileConfigMap,
+		},
+		{
+			Name:      "TLS",
+			Reconcile: r.reconcileTLS,
+		},
+		{
+			Name:      "RBAC",
+			Reconcile: r.reconcileRBAC,
+		},
+		{
+			Name:      "Init",
+			Reconcile: r.reconcileInit,
+		},
+		{
+			Name:      "Scale out",
+			Reconcile: r.reconcileScaleOut,
+		},
+		{
+			Name:      "Replica recovery",
+			Reconcile: r.reconcileReplicaRecovery,
+		},
+		{
+			Name:      "Storage",
+			Reconcile: r.reconcileStorage,
+		},
+		{
+			Name:      "StatefulSet",
+			Reconcile: r.reconcileStatefulSet,
+		},
+		{
+			Name:      "PodDisruptionBudget",
+			Reconcile: r.reconcilePodDisruptionBudget,
+		},
+		{
+			Name:      "Service",
+			Reconcile: r.reconcileService,
+		},
+		{
+			Name:      "Replication",
+			Reconcile: r.ReplicationReconciler.Reconcile,
+		},
+		{
+			Name:      "Labels",
+			Reconcile: r.reconcilePodLabels,
+		},
+		{
+			Name:      "Galera",
+			Reconcile: r.GaleraReconciler.Reconcile,
+		},
+		{
+			Name:      "Root Password",
+			Reconcile: r.reconcileRootPassword,
+		},
+		{
+			Name:      "Restore",
+			Reconcile: r.reconcileRestore,
+		},
+		{
+			Name:      "PITR",
+			Reconcile: r.reconcilePITR,
+		},
+		{
+			Name:      "MultiCluster",
+			Reconcile: r.reconcileMultiCluster,
+		},
+		{
+			Name:      "Maintenance",
+			Reconcile: r.MaintenanceReconciler.Reconcile,
+		},
+		{
+			Name:      "SQL",
+			Reconcile: r.reconcileSQL,
+		},
+		{
+			Name:      "Metrics",
+			Reconcile: r.reconcileMetrics,
+		},
+		{
+			Name:      "Connection",
+			Reconcile: r.reconcileConnection,
+		},
+	}
+
+	for _, p := range phases {
+		logger.V(1).Info(fmt.Sprintf("Reconcile phase %s", p.Name), "phase", p.Name)
+		result, err := p.Reconcile(ctx, &mariadb)
+		if err != nil {
+			if shouldSkipPhase(err) {
+				logger.V(1).Info(fmt.Sprintf("Skipping phase %s", p.Name), "phase", p.Name)
+				continue
+			}
+			var errBundle *multierror.Error
+			errBundle = multierror.Append(errBundle, err)
+
+			msg := fmt.Sprintf("Error reconciling %s: %v", p.Name, err)
+			patchErr := r.patchStatus(ctx, &mariadb, func(s *mariadbv1alpha1.MariaDBStatus) error {
+				patcher := r.ConditionReady.PatcherFailed(msg)
+				patcher(s)
+				return nil
+			})
+			if !apierrors.IsNotFound(patchErr) {
+				errBundle = multierror.Append(errBundle, patchErr)
+			}
+
+			if err := errBundle.ErrorOrNil(); err != nil {
+				return ctrl.Result{}, fmt.Errorf("error reconciling %s: %v", p.Name, err)
+			}
+		}
+		if !result.IsZero() {
+			return result, err
+		}
+	}
+	return requeueResult(ctx, &mariadb)
+}
+
+func shouldSkipPhase(err error) bool {
+	if apierrors.IsNotFound(err) {
+		return true
+	}
+	if errors.Is(err, ErrSkipReconciliationPhase) {
+		return true
+	}
+	return false
+}
+
+func requeueResult(ctx context.Context, mdb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	if mdb.IsMaintenanceModeEnabled() {
+		log.FromContext(ctx).V(1).Info("Maintenance mode enabled. Requeuing MariaDB...")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	if mdb.IsTLSEnabled() {
+		log.FromContext(ctx).V(1).Info("Requeuing MariaDB")
+		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil // ensure certificates get renewed
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *MariaDBReconciler) reconcileSecret(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	var secretKeyRefs []mariadbv1alpha1.GeneratedSecretKeyRef
+
+	if !mariadb.IsRootPasswordEmpty() {
+		secretKeyRefs = append(secretKeyRefs, mariadb.Spec.RootPasswordSecretKeyRef)
+	}
+	if mariadb.Spec.PasswordSecretKeyRef != nil {
+		secretKeyRefs = append(secretKeyRefs, *mariadb.Spec.PasswordSecretKeyRef)
+	}
+
+	if mariadb.IsHAEnabled() {
+		_, agent, err := mariadb.GetDataPlaneAgent()
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("error getting data-plane agent: %v", err)
+		}
+
+		basicAuth := ptr.Deref(agent.BasicAuth, mariadbv1alpha1.BasicAuth{})
+		if basicAuth.Enabled && !reflect.ValueOf(agent.BasicAuth.PasswordSecretKeyRef).IsZero() {
+			secretKeyRefs = append(secretKeyRefs, agent.BasicAuth.PasswordSecretKeyRef)
+		}
+	}
+	if mariadb.IsReplicationEnabled() {
+		replication := ptr.Deref(mariadb.Spec.Replication, mariadbv1alpha1.Replication{})
+		if replication.Replica.ReplPasswordSecretKeyRef != nil {
+			secretKeyRefs = append(secretKeyRefs, *replication.Replica.ReplPasswordSecretKeyRef)
+		}
+	}
+
+	for _, secretKeyRef := range secretKeyRefs {
+		req := secret.PasswordRequest{
+			Owner:    mariadb,
+			Metadata: mariadb.Spec.InheritMetadata,
+			Key: types.NamespacedName{
+				Name:      secretKeyRef.Name,
+				Namespace: mariadb.Namespace,
+			},
+			SecretKey: secretKeyRef.Key,
+			Generate:  secretKeyRef.Generate,
+		}
+		_, err := r.SecretReconciler.ReconcilePassword(ctx, req)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	return r.reconcileRootPasswordSecret(ctx, mariadb)
+}
+
+// reconcileRootPasswordSecret is used to create a duplicate of the root password secret.
+//
+// @WARN: If the internal duplicated password is modified externally, the operator will fail to reconcile the database
+func (r *MariaDBReconciler) reconcileRootPasswordSecret(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	if !mariadb.IsRootPasswordEmpty() {
+		rootPassword, err := r.RefResolver.SecretKeyRef(ctx, mariadb.Spec.RootPasswordSecretKeyRef.SecretKeySelector, mariadb.Namespace)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("error getting root password secret: %v", err)
+		}
+
+		internalSecretKey := mariadb.InternalRootPasswordSecretKey()
+
+		req := secret.SecretRequest{
+			Owner:        mariadb,
+			Metadata:     []*mariadbv1alpha1.Metadata{mariadb.Spec.InheritMetadata},
+			Key:          internalSecretKey,
+			SkipIfExists: true,
+			Data: map[string][]byte{
+				mariadb.Spec.RootPasswordSecretKeyRef.Key: []byte(rootPassword),
+			},
+		}
+		if err := r.SecretReconciler.Reconcile(ctx, &req); err != nil {
+			return ctrl.Result{}, fmt.Errorf("error reconciling internal root password secret: %v", err)
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *MariaDBReconciler) reconcileConfigMap(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	defaultConfigMapKeyRef := mariadb.DefaultConfigMapKeyRef()
+	config, err := defaultConfig(mariadb)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("error getting default config: %v", err)
+	}
+
+	req := configmap.ReconcileRequest{
+		Metadata: mariadb.Spec.InheritMetadata,
+		Owner:    mariadb,
+		Key: types.NamespacedName{
+			Name:      defaultConfigMapKeyRef.Name,
+			Namespace: mariadb.Namespace,
+		},
+		Data: map[string]string{
+			defaultConfigMapKeyRef.Key: config,
+		},
+	}
+	if err := r.ConfigMapReconciler.Reconcile(ctx, &req); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if mariadb.Spec.MyCnf != nil && mariadb.Spec.MyCnfConfigMapKeyRef != nil {
+		configMapKeyRef := *mariadb.Spec.MyCnfConfigMapKeyRef
+		req := configmap.ReconcileRequest{
+			Metadata: mariadb.Spec.InheritMetadata,
+			Owner:    mariadb,
+			Key: types.NamespacedName{
+				Name:      configMapKeyRef.Name,
+				Namespace: mariadb.Namespace,
+			},
+			Data: map[string]string{
+				configMapKeyRef.Key: *mariadb.Spec.MyCnf,
+			},
+		}
+		if err := r.ConfigMapReconciler.Reconcile(ctx, &req); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *MariaDBReconciler) reconcileRBAC(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	return ctrl.Result{}, r.RBACReconciler.ReconcileMariadbRBAC(ctx, mariadb)
+}
+
+func (r *MariaDBReconciler) reconcileStatefulSet(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	key := client.ObjectKeyFromObject(mariadb)
+	updateAnnotations, err := r.getUpdateAnnotations(ctx, mariadb)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("error getting Pod annotations: %v", err)
+	}
+	var pitr *mariadbv1alpha1.PointInTimeRecovery
+	if mariadb.IsPointInTimeRecoveryEnabled() {
+		pitr, err = r.RefResolver.PointInTimeRecovery(ctx, mariadb.Spec.PointInTimeRecoveryRef, mariadb.Namespace)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("error getting PointInTimeRecovery: %v", err)
+		}
+	}
+
+	desiredSts, err := r.Builder.BuildMariadbStatefulSet(mariadb, key, updateAnnotations, pitr)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("error building StatefulSet: %v", err)
+	}
+	shouldUpdate := mariadb.Spec.UpdateStrategy.Type != mariadbv1alpha1.NeverUpdateType
+
+	if err := r.StatefulSetReconciler.ReconcileWithUpdates(ctx, desiredSts, shouldUpdate); err != nil {
+		return ctrl.Result{}, fmt.Errorf("error reconciling StatefulSet: %v", err)
+	}
+
+	if result, err := r.reconcileUpdates(ctx, mariadb); !result.IsZero() || err != nil {
+		return result, err
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *MariaDBReconciler) reconcilePodLabels(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	if mariadb.Status.CurrentPrimaryPodIndex == nil {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	pods, err := mdbpod.ListMariaDBPods(ctx, r.Client, mariadb)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("error listing Pods: %v", err)
+	}
+
+	for _, pod := range pods {
+		var role = "replica"
+
+		if pod.Status.PodIP == "" || pod.Spec.NodeName == "" {
+			continue
+		}
+		podIndex, err := sts.PodIndex(pod.Name)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("error getting Pod '%s' index: %v", pod.Name, err)
+		}
+
+		if *podIndex == *mariadb.Status.CurrentPrimaryPodIndex {
+			role = "primary"
+		}
+
+		p := client.MergeFrom(pod.DeepCopy())
+		pod.Labels = labels.NewLabelsBuilder().WithLabels(pod.Labels).WithPodRole(role).Build()
+
+		if mdbpod.PodReady(&pod) {
+			if err := r.Patch(ctx, &pod, p); err != nil {
+				if apierrors.IsConflict(err) {
+					return ctrl.Result{Requeue: true}, nil //nolint:staticcheck // Requeue gives exponential backoff, which RequeueAfter cannot express.
+				}
+				if apierrors.IsNotFound(err) {
+					return ctrl.Result{Requeue: true}, nil //nolint:staticcheck // Requeue gives exponential backoff, which RequeueAfter cannot express.
+				}
+				return ctrl.Result{}, err
+			}
+		}
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *MariaDBReconciler) reconcilePodDisruptionBudget(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	if mariadb.IsHAEnabled() && mariadb.Spec.PodDisruptionBudget == nil {
+		return ctrl.Result{}, r.reconcileHighAvailabilityPDB(ctx, mariadb)
+	}
+	return ctrl.Result{}, r.reconcileDefaultPDB(ctx, mariadb)
+}
+
+func (r *MariaDBReconciler) reconcileService(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	if err := r.reconcileInternalService(ctx, mariadb); err != nil {
+		return ctrl.Result{}, fmt.Errorf("error reconciling internal Service: %v", err)
+	}
+	if err := r.reconcileDefaultService(ctx, mariadb); err != nil {
+		return ctrl.Result{}, fmt.Errorf("error reconciling default Service: %v", err)
+	}
+	if mariadb.IsHAEnabled() {
+		if result, err := r.reconcilePrimaryService(ctx, mariadb); !result.IsZero() || err != nil {
+			return ctrl.Result{}, err
+		}
+		if result, err := r.reconcileSecondaryService(ctx, mariadb); !result.IsZero() || err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{}, nil
+}
+
+func shouldReconcileRestore(mdb *mariadbv1alpha1.MariaDB) bool {
+	if mdb.IsUpdating() || mdb.IsResizingStorage() || mdb.IsSwitchingPrimary() || mdb.HasGaleraNotReadyCondition() {
+		return false
+	}
+	if mdb.HasRestoredBackup() {
+		return false
+	}
+	if mdb.Spec.BootstrapFrom == nil || mdb.Spec.BootstrapFrom.BackupContentType != mariadbv1alpha1.BackupContentTypeLogical {
+		return false
+	}
+	return true
+}
+
+func (r *MariaDBReconciler) reconcileRestore(ctx context.Context, mdb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	if !shouldReconcileRestore(mdb) {
+		return ctrl.Result{}, nil
+	}
+	if mdb.IsRestoringBackup() {
+		var existingRestore mariadbv1alpha1.Restore
+		if err := r.Get(ctx, mdb.RestoreKey(), &existingRestore); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, r.patchStatus(ctx, mdb, func(status *mariadbv1alpha1.MariaDBStatus) error {
+			if existingRestore.IsComplete() {
+				if err := r.Delete(ctx, &existingRestore); err != nil {
+					return err
+				}
+				condition.SetRestoredBackup(status)
+			} else {
+				condition.SetRestoringBackup(status)
+			}
+			return nil
+		})
+	}
+
+	healthy, err := health.IsStatefulSetHealthy(
+		ctx,
+		r.Client,
+		client.ObjectKeyFromObject(mdb),
+		health.WithDesiredReplicas(mdb.Spec.Replicas),
+		health.WithPort(mdb.Spec.Port),
+		health.WithEndpointPolicy(health.EndpointPolicyAll),
+	)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("error checking MariaDB health: %v", err)
+	}
+	if !healthy {
+		return ctrl.Result{}, nil
+	}
+
+	var existingRestore mariadbv1alpha1.Restore
+	if err := r.Get(ctx, mdb.RestoreKey(), &existingRestore); err == nil {
+		return ctrl.Result{}, nil
+	}
+
+	if err := r.patchStatus(ctx, mdb, func(status *mariadbv1alpha1.MariaDBStatus) error {
+		condition.SetRestoringBackup(status)
+		return nil
+	}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("error patching status: %v", err)
+	}
+
+	restore, err := r.Builder.BuildRestore(mdb, mdb.RestoreKey())
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("error building restore: %v", err)
+	}
+	return ctrl.Result{}, r.Create(ctx, restore)
+}
+
+func (r *MariaDBReconciler) reconcileDefaultPDB(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) error {
+	if mariadb.Spec.PodDisruptionBudget == nil {
+		return nil
+	}
+
+	key := client.ObjectKeyFromObject(mariadb)
+	var existingPDB policyv1.PodDisruptionBudget
+	if err := r.Get(ctx, key, &existingPDB); err == nil {
+		return nil
+	}
+
+	selectorLabels :=
+		labels.NewLabelsBuilder().
+			WithMariaDBSelectorLabels(mariadb).
+			Build()
+	opts := builder.PodDisruptionBudgetOpts{
+		Metadata:       mariadb.Spec.InheritMetadata,
+		Key:            key,
+		MinAvailable:   mariadb.Spec.PodDisruptionBudget.MinAvailable,
+		MaxUnavailable: mariadb.Spec.PodDisruptionBudget.MaxUnavailable,
+		SelectorLabels: selectorLabels,
+	}
+	pdb, err := r.Builder.BuildPodDisruptionBudget(opts, mariadb)
+	if err != nil {
+		return fmt.Errorf("error building PodDisruptionBudget: %v", err)
+	}
+	return r.Create(ctx, pdb)
+}
+
+func (r *MariaDBReconciler) reconcileHighAvailabilityPDB(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) error {
+	key := client.ObjectKeyFromObject(mariadb)
+	var existingPDB policyv1.PodDisruptionBudget
+	if err := r.Get(ctx, key, &existingPDB); err == nil {
+		return nil
+	}
+
+	selectorLabels :=
+		labels.NewLabelsBuilder().
+			WithMariaDBSelectorLabels(mariadb).
+			Build()
+	minAvailable := intstr.FromString("50%")
+	opts := builder.PodDisruptionBudgetOpts{
+		Metadata:       mariadb.Spec.InheritMetadata,
+		Key:            key,
+		MinAvailable:   &minAvailable,
+		SelectorLabels: selectorLabels,
+	}
+	pdb, err := r.Builder.BuildPodDisruptionBudget(opts, mariadb)
+	if err != nil {
+		return fmt.Errorf("error building PodDisruptionBudget: %v", err)
+	}
+	return r.Create(ctx, pdb)
+}
+
+func (r *MariaDBReconciler) reconcileDefaultService(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) error {
+	key := client.ObjectKeyFromObject(mariadb)
+	ports := []corev1.ServicePort{
+		{
+			Name: builder.MariadbPortName,
+			Port: mariadb.Spec.Port,
+		},
+	}
+	if mariadb.Spec.ServicePorts != nil {
+		ports = append(ports, kadapter.ToKubernetesSlice(mariadb.Spec.ServicePorts)...)
+	}
+	selectorLabelsBuilder :=
+		labels.NewLabelsBuilder().
+			WithMariaDBSelectorLabels(mariadb)
+	if mariadb.IsMaintenanceModeEnabled() {
+		selectorLabelsBuilder = selectorLabelsBuilder.WithCordon(mariadb)
+	}
+	selectorLabels := selectorLabelsBuilder.Build()
+
+	opts := builder.ServiceOpts{
+		Ports:          ports,
+		SelectorLabels: selectorLabels,
+		ExtraMeta:      mariadb.Spec.InheritMetadata,
+	}
+	if mariadb.Spec.Service != nil {
+		opts.ServiceTemplate = *mariadb.Spec.Service
+	}
+
+	desiredSvc, err := r.Builder.BuildService(key, mariadb, opts)
+	if err != nil {
+		return fmt.Errorf("error building Service: %v", err)
+	}
+	return r.ServiceReconciler.Reconcile(ctx, desiredSvc)
+}
+
+func (r *MariaDBReconciler) reconcileInternalService(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) error {
+	key := mariadb.InternalServiceKey()
+	ports := []corev1.ServicePort{
+		{
+			Name: builder.MariadbPortName,
+			Port: mariadb.Spec.Port,
+		},
+	}
+	if mariadb.Spec.ServicePorts != nil {
+		ports = append(ports, kadapter.ToKubernetesSlice(mariadb.Spec.ServicePorts)...)
+	}
+	if mariadb.IsHAEnabled() {
+		_, agent, err := mariadb.GetDataPlaneAgent()
+		if err != nil {
+			return fmt.Errorf("error getting data-plane agent: %v", err)
+		}
+		ports = append(ports, []corev1.ServicePort{
+			{
+				Name: agentresources.AgentPortName,
+				Port: agent.Port,
+			},
+			{
+				Name: agentresources.AgentProbePortName,
+				Port: agent.ProbePort,
+			},
+		}...)
+
+		if mariadb.IsGaleraEnabled() {
+			ports = append(ports, []corev1.ServicePort{
+				{
+					// App protocol is a fix for istio to recognize protocol before attempting MariaDB Galera cluster Pod-to-Pod communication.
+					// See: https://github.com/istio/istio/issues/38655#issuecomment-1169819447
+					Name:        galeraresources.GaleraClusterPortName,
+					Port:        galeraresources.GaleraClusterPort,
+					AppProtocol: ptr.To(galeraresources.MysqlAppProtocol),
+				},
+				{
+					Name:        galeraresources.GaleraISTPortName,
+					Port:        galeraresources.GaleraISTPort,
+					AppProtocol: ptr.To(galeraresources.MysqlAppProtocol),
+				},
+				{
+					Name:        galeraresources.GaleraSSTPortName,
+					Port:        galeraresources.GaleraSSTPort,
+					AppProtocol: ptr.To(galeraresources.MysqlAppProtocol),
+				},
+			}...)
+		}
+	}
+
+	selectorLabels :=
+		labels.NewLabelsBuilder().
+			WithMariaDBSelectorLabels(mariadb).
+			Build()
+
+	opts := builder.ServiceOpts{
+		Ports:          ports,
+		Headless:       true,
+		SelectorLabels: selectorLabels,
+		ExtraMeta:      mariadb.Spec.InheritMetadata,
+	}
+	desiredSvc, err := r.Builder.BuildService(key, mariadb, opts)
+	if err != nil {
+		return fmt.Errorf("error building internal Service: %v", err)
+	}
+	return r.ServiceReconciler.Reconcile(ctx, desiredSvc)
+}
+
+func (r *MariaDBReconciler) reconcilePrimaryService(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	if mariadb.Status.CurrentPrimaryPodIndex == nil {
+		log.FromContext(ctx).V(1).Info("'status.currentPrimaryPodIndex' must be set")
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+	}
+	key := mariadb.PrimaryServiceKey()
+	ports := []corev1.ServicePort{
+		{
+			Name: builder.MariadbPortName,
+			Port: mariadb.Spec.Port,
+		},
+	}
+	if mariadb.Spec.ServicePorts != nil {
+		ports = append(ports, kadapter.ToKubernetesSlice(mariadb.Spec.ServicePorts)...)
+	}
+	serviceLabelsBuilder :=
+		labels.NewLabelsBuilder().
+			WithMariaDBSelectorLabels(mariadb).
+			WithStatefulSetPod(mariadb.ObjectMeta, *mariadb.Status.CurrentPrimaryPodIndex)
+	if mariadb.IsMaintenanceModeEnabled() {
+		serviceLabelsBuilder = serviceLabelsBuilder.WithCordon(mariadb)
+	}
+	serviceLabels := serviceLabelsBuilder.Build()
+
+	opts := builder.ServiceOpts{
+		Ports:          ports,
+		SelectorLabels: serviceLabels,
+		ExtraMeta:      mariadb.Spec.InheritMetadata,
+	}
+	if mariadb.Spec.PrimaryService != nil {
+		opts.ServiceTemplate = *mariadb.Spec.PrimaryService
+	}
+
+	desiredSvc, err := r.Builder.BuildService(key, mariadb, opts)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("error building Service: %v", err)
+	}
+	return ctrl.Result{}, r.ServiceReconciler.Reconcile(ctx, desiredSvc)
+}
+
+func (r *MariaDBReconciler) reconcileSecondaryService(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	key := mariadb.SecondaryServiceKey()
+	ports := []corev1.ServicePort{
+		{
+			Name: builder.MariadbPortName,
+			Port: mariadb.Spec.Port,
+		},
+	}
+	if mariadb.Spec.ServicePorts != nil {
+		ports = append(ports, kadapter.ToKubernetesSlice(mariadb.Spec.ServicePorts)...)
+	}
+	selectorLabels :=
+		labels.NewLabelsBuilder().
+			WithMariaDBSelectorLabels(mariadb).
+			Build()
+	opts := builder.ServiceOpts{
+		ExcludeSelectorLabels: true,
+		Ports:                 ports,
+		SelectorLabels:        selectorLabels,
+		ExtraMeta:             mariadb.Spec.InheritMetadata,
+	}
+	if mariadb.Spec.SecondaryService != nil {
+		opts.ServiceTemplate = *mariadb.Spec.SecondaryService
+	}
+
+	desiredSvc, err := r.Builder.BuildService(key, mariadb, opts)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("error building Service: %v", err)
+	}
+	if err := r.ServiceReconciler.Reconcile(ctx, desiredSvc); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	secondaryServiceKey := mariadb.SecondaryServiceKey()
+	return r.EndpointsReconciler.Reconcile(ctx, secondaryServiceKey, mariadb, secondaryServiceKey.Name)
+}
+
+func (r *MariaDBReconciler) reconcileSQL(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	if !mariadb.IsReady() {
+		log.FromContext(ctx).V(1).Info("MariaDB not ready. Requeuing SQL resources")
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+	}
+	if err := r.reconcileDatabase(ctx, mariadb); err != nil {
+		return ctrl.Result{}, fmt.Errorf("error reconciling database: %v", err)
+	}
+	if result, err := r.reconcileUsers(ctx, mariadb); !result.IsZero() || err != nil {
+		return result, err
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *MariaDBReconciler) reconcileDatabase(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) error {
+	if mariadb.Spec.Database == nil {
+		return nil
+	}
+	var database mariadbv1alpha1.Database
+	err := r.Get(ctx, mariadb.MariadbDatabaseKey(), &database)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("error getting database: %v", err)
+	}
+
+	opts := builder.DatabaseOpts{
+		Name:          *mariadb.Spec.Database,
+		CleanupPolicy: mariadb.Spec.CleanupPolicy,
+		Metadata:      mariadb.Spec.InheritMetadata,
+		MariaDBRef: mariadbv1alpha1.MariaDBRef{
+			ObjectReference: mariadbv1alpha1.ObjectReference{
+				Name:      mariadb.Name,
+				Namespace: mariadb.Namespace,
+			},
+		},
+	}
+	db, err := r.Builder.BuildDatabase(mariadb.MariadbDatabaseKey(), mariadb, opts)
+	if err != nil {
+		return fmt.Errorf("error building database: %v", err)
+	}
+	return r.Create(ctx, db)
+}
+
+func (r *MariaDBReconciler) reconcileUsers(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	sysUserKey := mariadb.MariadbSysUserKey()
+	sysGrantKey := mariadb.MariadbSysGrantKey()
+	userOpts := builder.UserOpts{
+		MariaDBRef: mariadbv1alpha1.MariaDBRef{
+			ObjectReference: mariadbv1alpha1.ObjectReference{
+				Name:      mariadb.Name,
+				Namespace: mariadb.Namespace,
+			},
+		},
+		Metadata:             mariadb.Spec.InheritMetadata,
+		MaxUserConnections:   20,
+		Name:                 "mariadb.sys",
+		Host:                 "localhost",
+		PasswordSecretKeyRef: nil,
+		CleanupPolicy:        ptr.To(mariadbv1alpha1.CleanupPolicySkip),
+	}
+	grantOpts := auth.GrantOpts{
+		Key: sysGrantKey,
+		GrantOpts: builder.GrantOpts{
+			MariaDBRef: mariadbv1alpha1.MariaDBRef{
+				ObjectReference: mariadbv1alpha1.ObjectReference{
+					Name:      mariadb.Name,
+					Namespace: mariadb.Namespace,
+				},
+			},
+			Metadata: mariadb.Spec.InheritMetadata,
+			Privileges: []string{
+				"SELECT",
+				"UPDATE",
+				"DELETE",
+			},
+			Database:      "mysql",
+			Table:         "global_priv",
+			Username:      "mariadb.sys",
+			Host:          "localhost",
+			CleanupPolicy: ptr.To(mariadbv1alpha1.CleanupPolicySkip),
+		},
+	}
+
+	if result, err := r.AuthReconciler.ReconcileUserGrant(ctx, sysUserKey, mariadb, userOpts, grantOpts); !result.IsZero() || err != nil {
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("error reconciling mariadb.sys user auth: %v", err)
+		}
+		return result, err
+	}
+
+	var sysGrant mariadbv1alpha1.Grant
+	if err := r.Get(ctx, sysGrantKey, &sysGrant); err != nil {
+		return ctrl.Result{}, fmt.Errorf("error getting mariadb.sys Grant: %v", err)
+	}
+	if !sysGrant.IsReady() {
+		log.FromContext(ctx).V(1).Info("mariadb.sys Grant not ready. Requeuing...")
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+	}
+
+	if mariadb.IsInitialUserEnabled() {
+		userKey := mariadb.MariadbUserKey()
+		user := builder.UserOpts{
+			MariaDBRef: mariadbv1alpha1.MariaDBRef{
+				ObjectReference: mariadbv1alpha1.ObjectReference{
+					Name:      mariadb.Name,
+					Namespace: mariadb.Namespace,
+				},
+			},
+			Metadata:           mariadb.Spec.InheritMetadata,
+			CleanupPolicy:      mariadb.Spec.CleanupPolicy,
+			MaxUserConnections: 20,
+			Name:               *mariadb.Spec.Username,
+			Host:               "%",
+		}
+		if mariadb.Spec.PasswordPlugin != nil {
+			user.PasswordPlugin = mariadb.Spec.PasswordPlugin
+		} else if mariadb.Spec.PasswordHashSecretKeyRef != nil {
+			user.PasswordHashSecretKeyRef = mariadb.Spec.PasswordHashSecretKeyRef
+		} else if mariadb.Spec.PasswordSecretKeyRef != nil {
+			user.PasswordSecretKeyRef = &mariadb.Spec.PasswordSecretKeyRef.SecretKeySelector
+		}
+		grant := auth.GrantOpts{
+			Key: mariadb.MariadbGrantKey(),
+			GrantOpts: builder.GrantOpts{
+				MariaDBRef: mariadbv1alpha1.MariaDBRef{
+					ObjectReference: mariadbv1alpha1.ObjectReference{
+						Name:      mariadb.Name,
+						Namespace: mariadb.Namespace,
+					},
+				},
+				Metadata:      mariadb.Spec.InheritMetadata,
+				CleanupPolicy: mariadb.Spec.CleanupPolicy,
+				Privileges: []string{
+					"ALL PRIVILEGES",
+				},
+				Database: *mariadb.Spec.Database,
+				Table:    "*",
+				Username: *mariadb.Spec.Username,
+				Host:     "%",
+			},
+		}
+
+		if result, err := r.AuthReconciler.ReconcileUserGrant(ctx, userKey, mariadb, user, grant); !result.IsZero() || err != nil {
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("error reconciling user auth: %v", err)
+			}
+			return result, err
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *MariaDBReconciler) setSpecDefaults(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithName("spec")
+
+	return ctrl.Result{}, r.patch(ctx, mariadb, func(mdb *mariadbv1alpha1.MariaDB) error {
+		if err := mdb.SetDefaults(r.Environment); err != nil {
+			return fmt.Errorf("error setting defaults: %v", err)
+		}
+
+		if mdb.Spec.BootstrapFrom == nil || mdb.HasRestoredBackup() {
+			return nil
+		}
+		bootstrapFrom := ptr.Deref(mdb.Spec.BootstrapFrom, mariadbv1alpha1.BootstrapFrom{})
+		backupRef := ptr.Deref(bootstrapFrom.BackupRef, mariadbv1alpha1.TypedLocalObjectReference{})
+		var physicalBackup *mariadbv1alpha1.PhysicalBackup
+
+		// TODO: integration tests
+		if bootstrapFrom.PointInTimeRecoveryRef != nil {
+			logger.V(1).Info("Defaulting bootstrapFrom with PointInTimeRecovery")
+
+			pitr, err := r.RefResolver.PointInTimeRecovery(ctx, bootstrapFrom.PointInTimeRecoveryRef, mdb.Namespace)
+			if err != nil {
+				return fmt.Errorf("error getting PointInTimeRecovery: %v", err)
+			}
+			pb, err := r.RefResolver.PhysicalBackup(ctx, &pitr.Spec.PhysicalBackupRef, mdb.Namespace)
+			if err != nil {
+				return fmt.Errorf("error getting PhysicalBackup: %v", err)
+			}
+			physicalBackup = pb
+		} else if backupRef.Kind == mariadbv1alpha1.PhysicalBackupKind {
+			logger.V(1).Info("Defaulting bootstrapFrom with PhysicalBackup")
+
+			pb, err := r.RefResolver.PhysicalBackup(ctx, backupRef.LocalReference(), mdb.Namespace)
+			if err != nil {
+				return fmt.Errorf("error getting PhysicalBackup: %v", err)
+			}
+			physicalBackup = pb
+		} else if backupRef.Kind == mariadbv1alpha1.BackupKind {
+			logger.V(1).Info("Defaulting bootstrapFrom with Backup not needed, skipping...")
+			// logical backups don't need defaulting, this is managed by the Restore resource
+			return nil
+		}
+
+		if physicalBackup != nil {
+			if physicalBackup.Spec.Storage.VolumeSnapshot != nil {
+				targetSnapshot, err := r.getTargetVolumeSnapshot(ctx, physicalBackup, mdb.Spec.BootstrapFrom.TargetRecoveryTime)
+				if err != nil {
+					return fmt.Errorf("error getting target VolumeSnapshot: %v", err)
+				}
+				logger.V(1).Info("Setting bootstrapFrom defaults with PhysicalBackup based on VolumeSnapshot", "snapshot", targetSnapshot)
+
+				mdb.Spec.BootstrapFrom.SetDefaultsWithVolumeSnapshotRef(&mariadbv1alpha1.LocalObjectReference{
+					Name: targetSnapshot,
+				})
+			} else {
+				logger.V(1).Info("Setting bootstrapFrom defaults with PhysicalBackup based on mariadb-backup")
+
+				if err := mdb.Spec.BootstrapFrom.SetDefaultsWithPhysicalBackup(physicalBackup); err != nil {
+					return fmt.Errorf("error setting defaults with physical backup: %v", err)
+				}
+			}
+		}
+
+		mdb.Spec.BootstrapFrom.SetDefaults(mdb)
+		return nil
+	})
+}
+
+func (r *MariaDBReconciler) getTargetVolumeSnapshot(ctx context.Context, backup *mariadbv1alpha1.PhysicalBackup,
+	targetRecoveryTime *metav1.Time) (string, error) {
+	if backup.Spec.Storage.VolumeSnapshot == nil {
+		return "", errors.New("VolumeSnapshot must be used as storage in PhysicalBackup")
+	}
+
+	snapshotList, err := mdbsnapshot.ListReadyVolumeSnapshots(ctx, r.Client, backup)
+	if err != nil {
+		return "", fmt.Errorf("error listing ready VolumeSnapshots: %v", err)
+	}
+	snapshotNames := make([]string, len(snapshotList.Items))
+	for i, snapshot := range snapshotList.Items {
+		snapshotNames[i] = snapshot.Name
+	}
+
+	recoveryTime := ptr.Deref(targetRecoveryTime, metav1.Time{Time: time.Now()})
+	logger := log.FromContext(ctx).WithName("snapshot")
+
+	targetSnapshot, err := r.BackupProcessor.GetBackupTargetFile(snapshotNames, recoveryTime.Time, logger)
+	if err != nil {
+		return "", fmt.Errorf("error getting target VolumeSnapshot: %v", err)
+	}
+	return targetSnapshot, nil
+}
+
+func (r *MariaDBReconciler) reconcileSuspend(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	if mariadb.IsSuspended() {
+		log.FromContext(ctx).V(1).Info("MariaDB is suspended. Skipping...")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	// Skip reconciliation if the MariaDB CR is being deleted
+	if !mariadb.DeletionTimestamp.IsZero() {
+		log.FromContext(ctx).Info("MariaDB is being deleted. Skipping...")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *MariaDBReconciler) reconcileConnection(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	if !mariadb.IsInitialUserEnabled() {
+		return ctrl.Result{}, nil
+	}
+	if !mariadb.IsReady() {
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+	}
+	if mariadb.IsHAEnabled() {
+		if mariadb.Spec.PrimaryConnection != nil {
+			key := mariadb.PrimaryConnectioneKey()
+			connTpl := mariadb.Spec.PrimaryConnection
+			connTpl.ServiceName = ptr.To(mariadb.PrimaryServiceKey().Name)
+
+			if err := r.reconcileConnectionTemplate(ctx, key, connTpl, mariadb); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		if mariadb.Spec.SecondaryConnection != nil {
+			key := mariadb.SecondaryConnectioneKey()
+			connTpl := mariadb.Spec.SecondaryConnection
+			connTpl.ServiceName = ptr.To(mariadb.SecondaryServiceKey().Name)
+
+			if err := r.reconcileConnectionTemplate(ctx, key, connTpl, mariadb); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
+	return ctrl.Result{}, r.reconcileDefaultConnection(ctx, mariadb)
+}
+
+func (r *MariaDBReconciler) reconcileConnectionTemplate(ctx context.Context, key types.NamespacedName,
+	connTpl *mariadbv1alpha1.ConnectionTemplate, mariadb *mariadbv1alpha1.MariaDB) error {
+	var existingConn mariadbv1alpha1.Connection
+	if err := r.Get(ctx, key, &existingConn); err == nil {
+		return nil
+	}
+
+	if mariadb.Spec.Username == nil || mariadb.Spec.PasswordSecretKeyRef == nil {
+		log.FromContext(ctx).Error(
+			errors.New("unable to reconcile Connection"),
+			"spec.user and spec.passwordSecretKeyRef must have been initialized",
+			"user", mariadb.Spec.Username,
+			"passwordKeyRef", mariadb.Spec.PasswordSecretKeyRef,
+		)
+		return nil
+	}
+	connOpts := builder.ConnectionOpts{
+		Metadata:             mariadb.Spec.InheritMetadata,
+		MariaDB:              mariadb,
+		Key:                  key,
+		Username:             *mariadb.Spec.Username,
+		PasswordSecretKeyRef: &mariadb.Spec.PasswordSecretKeyRef.SecretKeySelector,
+		Database:             mariadb.Spec.Database,
+		Template:             connTpl,
+	}
+	conn, err := r.Builder.BuildConnection(connOpts, mariadb)
+	if err != nil {
+		return fmt.Errorf("error building Connection: %v", err)
+	}
+	return r.Create(ctx, conn)
+}
+
+func (r *MariaDBReconciler) reconcileDefaultConnection(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB) error {
+	if mariadb.Spec.Connection == nil {
+		return nil
+	}
+	key := client.ObjectKeyFromObject(mariadb)
+	var existingConn mariadbv1alpha1.Connection
+	if err := r.Get(ctx, key, &existingConn); err == nil {
+		return nil
+	}
+
+	if mariadb.Spec.Username == nil || mariadb.Spec.PasswordSecretKeyRef == nil {
+		log.FromContext(ctx).Error(
+			errors.New("unable to reconcile default Connection"),
+			"spec.user and spec.passwordSecretKeyRef must have been initialized",
+			"user", mariadb.Spec.Username,
+			"passwordKeyRef", mariadb.Spec.PasswordSecretKeyRef,
+		)
+		return nil
+	}
+	connOpts := builder.ConnectionOpts{
+		Metadata:             mariadb.Spec.InheritMetadata,
+		MariaDB:              mariadb,
+		Key:                  key,
+		Username:             *mariadb.Spec.Username,
+		PasswordSecretKeyRef: &mariadb.Spec.PasswordSecretKeyRef.SecretKeySelector,
+		Database:             mariadb.Spec.Database,
+		Template:             mariadb.Spec.Connection,
+	}
+	conn, err := r.Builder.BuildConnection(connOpts, mariadb)
+	if err != nil {
+		return fmt.Errorf("error building Connection: %v", err)
+	}
+	return r.Create(ctx, conn)
+}
+
+func (r *MariaDBReconciler) patchStatus(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB,
+	patcher patcherMariaDB) error {
+	patch := client.MergeFrom(mariadb.DeepCopy())
+	if err := patcher(&mariadb.Status); err != nil {
+		return err
+	}
+	return r.Status().Patch(ctx, mariadb, patch)
+}
+
+func (r *MariaDBReconciler) patch(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB,
+	patcher func(*mariadbv1alpha1.MariaDB) error) error {
+	patch := client.MergeFrom(mariadb.DeepCopy())
+	if err := patcher(mariadb); err != nil {
+		return err
+	}
+	return r.Patch(ctx, mariadb, patch)
+}
+
+func (r *MariaDBReconciler) patchMaxScale(ctx context.Context, mxs *mariadbv1alpha1.MaxScale,
+	patcher func(*mariadbv1alpha1.MaxScale)) error {
+	patch := client.MergeFrom(mxs.DeepCopy())
+	patcher(mxs)
+	return r.Patch(ctx, mxs, patch)
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *MariaDBReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, env *environment.OperatorEnv,
+	opts controller.Options) error {
+	builder := ctrl.NewControllerManagedBy(mgr).
+		For(&mariadbv1alpha1.MariaDB{}).
+		Owns(&mariadbv1alpha1.MaxScale{}).
+		Owns(&mariadbv1alpha1.Connection{}).
+		Owns(&mariadbv1alpha1.Restore{}).
+		Owns(&mariadbv1alpha1.User{}).
+		Owns(&mariadbv1alpha1.Grant{}).
+		Owns(&corev1.ConfigMap{}).
+		Owns(&corev1.Service{}).
+		Owns(&corev1.Secret{}).
+		Owns(&corev1.Event{}).
+		Owns(&corev1.ServiceAccount{}).
+		Owns(&appsv1.StatefulSet{}).
+		Owns(&appsv1.Deployment{}).
+		Owns(&policyv1.PodDisruptionBudget{}).
+		Owns(&rbacv1.Role{}).
+		Owns(&rbacv1.RoleBinding{}).
+		WithOptions(opts)
+
+	currentNamespaceOnly, err := env.CurrentNamespaceOnly()
+	if err != nil {
+		return fmt.Errorf("error checking operator watch scope: %v", err)
+	}
+	if !currentNamespaceOnly {
+		builder = builder.Owns(&rbacv1.ClusterRoleBinding{})
+	}
+
+	if err := mariadbv1alpha1.IndexMariaDB(ctx, mgr, builder, r.Client); err != nil {
+		return fmt.Errorf("error indexing MariaDB: %v", err)
+	}
+
+	return builder.Complete(r)
+}
+
+func defaultConfig(mariadb *mariadbv1alpha1.MariaDB) (string, error) {
+	tpl := createTpl("0-default.cnf", `[mariadb]
+skip-name-resolve
+temp-pool
+ignore_db_dirs = 'lost+found'
+{{- with .TimeZone }}
+default_time_zone = {{ . }}
+{{- end }}
+{{- with .LogSlaveUpdates }}
+log_slave_updates=ON
+{{- end }}
+`)
+
+	buf := new(bytes.Buffer)
+	err := tpl.Execute(buf, struct {
+		TimeZone        *string
+		LogSlaveUpdates bool
+	}{
+		TimeZone: mariadb.Spec.TimeZone,
+		// See: https://mariadb.com/docs/server/ha-and-performance/standard-replication/replication-and-binary-log-system-variables#log_slave_updates
+		// We set this so:
+		// - We don't have to re-configure the replication in the replica cluster when primary cluster changes
+		// - Replica cluster primary can relay events to its replicas
+		LogSlaveUpdates: mariadb.IsMultiClusterEnabled(),
+	})
+	if err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+func createTpl(name, t string) *template.Template {
+	return template.Must(template.New(name).Parse(t))
+}

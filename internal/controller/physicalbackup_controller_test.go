@@ -1,0 +1,418 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/go-logr/logr"
+	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/job"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+var _ = Describe("PhysicalBackup", Label("basic"), func() {
+	BeforeEach(func() {
+		By("Waiting for MariaDB to be ready")
+		expectMariadbReady(testCtx, k8sClient, testMdbkey)
+	})
+
+	DescribeTable("Creating a PhysicalBackup",
+		func(
+			resourceName string,
+			builderFn physicalBackupBuilder,
+			testFn func(*mariadbv1alpha1.PhysicalBackup),
+		) {
+			key := types.NamespacedName{
+				Name:      resourceName,
+				Namespace: testNamespace,
+			}
+			backup := builderFn(key)
+			testFn(backup)
+		},
+		Entry(
+			"should reconcile a Job with PVC storage",
+			"physicalbackup-job-pvc-test",
+			buildPhysicalBackupWithPVCStorage(testMdbkey),
+			testPhysicalBackup,
+		),
+		Entry(
+			"should reconcile a Job with Volume storage",
+			"physicalbackup-job-volume-test",
+			buildPhysicalBackupWithVolumeStorage(testMdbkey),
+			testPhysicalBackup,
+		),
+		Entry(
+			"should reconcile a Job with ABS storage",
+			"physicalbackup-job-abs-test",
+			buildPhysicalBackupWithABSStorage(testMdbkey, "test-physicalbackup", ""),
+			testPhysicalBackup,
+		),
+		Entry(
+			"should reconcile a Job with S3 storage",
+			"physicalbackup-job-s3-test",
+			buildPhysicalBackupWithS3Storage(testMdbkey, "test-physicalbackup", ""),
+			testPhysicalBackup,
+		),
+		Entry(
+			"should reconcile a Job with ABS storage with prefix",
+			"physicalbackup-job-abs-prefix-test",
+			buildPhysicalBackupWithABSStorage(testMdbkey, "test-physicalbackup", "mariadb"),
+			testPhysicalBackup,
+		),
+		Entry(
+			"should reconcile a Job with S3 storage with prefix",
+			"physicalbackup-job-s3-prefix-test",
+			buildPhysicalBackupWithS3Storage(testMdbkey, "test-physicalbackup", "mariadb"),
+			testPhysicalBackup,
+		),
+		Entry(
+			"should reconcile a Job with ABS storage and bzip2 compression",
+			"physicalbackup-job-abs-bzip2-test",
+			applyDecoratorChain(
+				buildPhysicalBackupWithABSStorage(testMdbkey, "test-physicalbackup", ""),
+				decoratePhysicalBackupWithBzip2Compression,
+			),
+			testPhysicalBackup,
+		),
+		Entry(
+			"should reconcile a Job with S3 storage and bzip2 compression",
+			"physicalbackup-job-s3-bzip2-test",
+			applyDecoratorChain(
+				buildPhysicalBackupWithS3Storage(testMdbkey, "test-physicalbackup", ""),
+				decoratePhysicalBackupWithBzip2Compression,
+			),
+			testPhysicalBackup,
+		),
+		Entry(
+			"should reconcile a Job with ABS storage and gzip compression",
+			"physicalbackup-job-abs-gzip-test",
+			applyDecoratorChain(
+				buildPhysicalBackupWithABSStorage(testMdbkey, "test-physicalbackup", ""),
+				decoratePhysicalBackupWithGzipCompression,
+			),
+			testPhysicalBackup,
+		),
+		Entry(
+			"should reconcile a Job with S3 storage and gzip compression",
+			"physicalbackup-job-s3-gzip-test",
+			applyDecoratorChain(
+				buildPhysicalBackupWithS3Storage(testMdbkey, "test-physicalbackup", ""),
+				decoratePhysicalBackupWithGzipCompression,
+			),
+			testPhysicalBackup,
+		),
+		Entry(
+			"should reconcile a Job with S3 storage and SSEC",
+			"physicalbackup-job-s3-ssec-test",
+			applyDecoratorChain(
+				buildPhysicalBackupWithS3Storage(testMdbkey, "test-physicalbackup", ""),
+				decoratePhysicalBackupWithSSEC,
+			),
+			testPhysicalBackup,
+		),
+		Entry(
+			"should reconcile a Job with ABS storage and staging storage",
+			"physicalbackup-job-abs-staging-test",
+			applyDecoratorChain(
+				buildPhysicalBackupWithABSStorage(testMdbkey, "test-physicalbackup", ""),
+				decoratePhysicalBackupWithStagingStorage,
+			),
+			testPhysicalBackup,
+		),
+		Entry(
+			"should reconcile a Job with S3 storage and staging storage",
+			"physicalbackup-job-s3-staging-test",
+			applyDecoratorChain(
+				buildPhysicalBackupWithS3Storage(testMdbkey, "test-physicalbackup", ""),
+				decoratePhysicalBackupWithStagingStorage,
+			),
+			testPhysicalBackup,
+		),
+		Entry(
+			"should reconcile a scheduled Job with ABS storage",
+			"physicalbackup-scheduled-job-abs-test",
+			applyDecoratorChain(
+				buildPhysicalBackupWithABSStorage(testMdbkey, "test-physicalbackup", ""),
+				decoratePhysicalBackupWithSchedule,
+			),
+			testPhysicalBackup,
+		),
+		Entry(
+			"should reconcile a scheduled Job with S3 storage",
+			"physicalbackup-scheduled-job-s3-test",
+			applyDecoratorChain(
+				buildPhysicalBackupWithS3Storage(testMdbkey, "test-physicalbackup", ""),
+				decoratePhysicalBackupWithSchedule,
+			),
+			testPhysicalBackup,
+		),
+		Entry(
+			"should reconcile a VolumeSnapshot",
+			"physicalbackup-volumesnapshot-test",
+			buildPhysicalBackupWithVolumeSnapshotStorage(testMdbkey),
+			testPhysicalBackup,
+		),
+		Entry(
+			"should reconcile a scheduled VolumeSnapshot",
+			"physicalbackup-scheduled-volumesnapshot-test",
+			applyDecoratorChain(
+				buildPhysicalBackupWithVolumeSnapshotStorage(testMdbkey),
+				decoratePhysicalBackupWithSchedule,
+			),
+			testPhysicalBackup,
+		),
+	)
+
+	It("should not recreate the Jobs of a completed one-off PhysicalBackup", func() {
+		key := types.NamespacedName{
+			Name:      "physicalbackup-completed-job-deleted-test",
+			Namespace: testNamespace,
+		}
+		backup := buildPhysicalBackupWithPVCStorage(testMdbkey)(key)
+		testPhysicalBackup(backup)
+
+		By("Deleting the completed Jobs")
+		jobList, err := job.ListJobs(testCtx, k8sClient, backup)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(jobList.Items).ToNot(BeEmpty())
+		for _, j := range jobList.Items {
+			Expect(k8sClient.Delete(testCtx, &j, client.PropagationPolicy(metav1.DeletePropagationBackground))).To(Succeed())
+		}
+
+		By("Expecting the Jobs to be deleted eventually")
+		Eventually(func(g Gomega) {
+			jobList, err := job.ListJobs(testCtx, k8sClient, backup)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(jobList.Items).To(BeEmpty())
+		}, testTimeout, testInterval).Should(Succeed())
+
+		By("Expecting the Jobs not to be recreated and the PhysicalBackup to remain complete")
+		Consistently(func(g Gomega) {
+			jobList, err := job.ListJobs(testCtx, k8sClient, backup)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(jobList.Items).To(BeEmpty())
+			g.Expect(k8sClient.Get(testCtx, key, backup)).To(Succeed())
+			g.Expect(backup.IsSuccessful()).To(BeTrue())
+		}, 10*time.Second, testInterval).Should(Succeed())
+	})
+})
+
+var _ = Describe("PhysicalBackup target", Label("basic"), func() {
+	buildTargetFn := func(podIndex *int, err error) targetFn {
+		return func(_ context.Context, _ *mariadbv1alpha1.MariaDB, _ logr.Logger) (*int, error) {
+			return podIndex, err
+		}
+	}
+	logger := logr.Discard()
+
+	DescribeTable("Getting target Pod index",
+		func(
+			backup *mariadbv1alpha1.PhysicalBackup,
+			mdb *mariadbv1alpha1.MariaDB,
+			primaryFn targetFn,
+			replicaFn targetFn,
+			wantPodIndex *int,
+			wantErr bool,
+		) {
+			podIndex, err := physicalBackupTargetWithFuncs(
+				testCtx,
+				backup,
+				mdb,
+				primaryFn,
+				replicaFn,
+				logger,
+			)
+			Expect(podIndex).To(BeEquivalentTo(wantPodIndex))
+
+			if wantErr {
+				Expect(err).To(HaveOccurred())
+			} else {
+				Expect(err).ToNot(HaveOccurred())
+			}
+		},
+		Entry(
+			"standalone",
+			&mariadbv1alpha1.PhysicalBackup{
+				Spec: mariadbv1alpha1.PhysicalBackupSpec{
+					Target: nil,
+				},
+			},
+			&mariadbv1alpha1.MariaDB{},
+			buildTargetFn(ptr.To(0), nil),
+			nil,
+			ptr.To(0),
+			false,
+		),
+		Entry(
+			"standalone - no target available",
+			&mariadbv1alpha1.PhysicalBackup{
+				Spec: mariadbv1alpha1.PhysicalBackupSpec{
+					Target: nil,
+				},
+			},
+			&mariadbv1alpha1.MariaDB{},
+			buildTargetFn(nil, errPhysicalBackupNoTargetPodsAvailable),
+			nil,
+			nil,
+			true,
+		),
+		Entry(
+			"HA - default target",
+			&mariadbv1alpha1.PhysicalBackup{
+				Spec: mariadbv1alpha1.PhysicalBackupSpec{
+					Target: nil,
+				},
+			},
+			&mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+				},
+			},
+			buildTargetFn(ptr.To(0), nil),
+			buildTargetFn(ptr.To(1), nil),
+			ptr.To(1),
+			false,
+		),
+		Entry(
+			"HA - Replica target",
+			&mariadbv1alpha1.PhysicalBackup{
+				Spec: mariadbv1alpha1.PhysicalBackupSpec{
+					Target: ptr.To(mariadbv1alpha1.PhysicalBackupTargetReplica),
+				},
+			},
+			&mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+				},
+			},
+			nil,
+			buildTargetFn(ptr.To(1), nil),
+			ptr.To(1),
+			false,
+		),
+		Entry(
+			"HA - Replica target, no replicas available",
+			&mariadbv1alpha1.PhysicalBackup{
+				Spec: mariadbv1alpha1.PhysicalBackupSpec{
+					Target: ptr.To(mariadbv1alpha1.PhysicalBackupTargetReplica),
+				},
+			},
+			&mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+				},
+			},
+			nil,
+			buildTargetFn(nil, errPhysicalBackupNoTargetPodsAvailable),
+			nil,
+			true,
+		),
+		Entry(
+			"HA - Replica target, get target error",
+			&mariadbv1alpha1.PhysicalBackup{
+				Spec: mariadbv1alpha1.PhysicalBackupSpec{
+					Target: ptr.To(mariadbv1alpha1.PhysicalBackupTargetReplica),
+				},
+			},
+			&mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+				},
+			},
+			nil,
+			buildTargetFn(nil, errors.New("error getting target")),
+			nil,
+			true,
+		),
+		Entry(
+			"HA - PreferReplica target",
+			&mariadbv1alpha1.PhysicalBackup{
+				Spec: mariadbv1alpha1.PhysicalBackupSpec{
+					Target: ptr.To(mariadbv1alpha1.PhysicalBackupTargetPreferReplica),
+				},
+			},
+			&mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+				},
+			},
+			buildTargetFn(ptr.To(0), nil),
+			buildTargetFn(ptr.To(1), nil),
+			ptr.To(1),
+			false,
+		),
+		Entry(
+			"HA - PreferReplica target, no replicas available",
+			&mariadbv1alpha1.PhysicalBackup{
+				Spec: mariadbv1alpha1.PhysicalBackupSpec{
+					Target: ptr.To(mariadbv1alpha1.PhysicalBackupTargetPreferReplica),
+				},
+			},
+			&mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+				},
+			},
+			buildTargetFn(ptr.To(0), nil),
+			buildTargetFn(nil, errPhysicalBackupNoTargetPodsAvailable),
+			ptr.To(0),
+			false,
+		),
+		Entry(
+			"HA - PreferReplica target, no replicas nor primary available",
+			&mariadbv1alpha1.PhysicalBackup{
+				Spec: mariadbv1alpha1.PhysicalBackupSpec{
+					Target: ptr.To(mariadbv1alpha1.PhysicalBackupTargetPreferReplica),
+				},
+			},
+			&mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+				},
+			},
+			buildTargetFn(nil, errPhysicalBackupNoTargetPodsAvailable),
+			buildTargetFn(nil, errPhysicalBackupNoTargetPodsAvailable),
+			nil,
+			true,
+		),
+		Entry(
+			"HA - PreferReplica target, get target error",
+			&mariadbv1alpha1.PhysicalBackup{
+				Spec: mariadbv1alpha1.PhysicalBackupSpec{
+					Target: ptr.To(mariadbv1alpha1.PhysicalBackupTargetPreferReplica),
+				},
+			},
+			&mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+				},
+			},
+			buildTargetFn(nil, errors.New("error getting target")),
+			buildTargetFn(nil, errors.New("error getting target")),
+			nil,
+			true,
+		),
+	)
+})

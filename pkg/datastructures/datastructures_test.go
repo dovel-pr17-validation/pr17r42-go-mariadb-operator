@@ -1,0 +1,613 @@
+package datastructures
+
+import (
+	"reflect"
+	"sort"
+	"strings"
+	"testing"
+
+	"k8s.io/utils/ptr"
+)
+
+func TestDataStructures(t *testing.T) {
+	idx := newIndex("a", "b", "b", "c", "d", "e")
+	if !reflect.DeepEqual(idx, newIndex("a", "b", "c", "d", "e")) {
+		t.Error("expecting index to remove duplicates")
+	}
+
+	item, err := Get(idx, "b")
+	expectedItem := "b"
+	if err != nil {
+		t.Errorf("expecting error to not have occurred: %v", err)
+	}
+	if item != expectedItem {
+		t.Errorf("expecting item to be %s, got %s", "a", item)
+	}
+
+	keys := Keys(idx)
+	expectedKeys := []string{"a", "b", "c", "d", "e"}
+	sort.Strings(keys)
+	sort.Strings(expectedKeys)
+	if !reflect.DeepEqual(keys, expectedKeys) {
+		t.Errorf("expecting keys to be %v, got: %v", expectedKeys, keys)
+	}
+
+	exists := AllExists(idx, "a", "b", "c")
+	expectedExists := true
+	if exists != expectedExists {
+		t.Errorf("expecting exists to be %v, got: %v", expectedExists, exists)
+	}
+
+	exists = AllExists(idx, "a", "b", "c", "z")
+	expectedExists = false
+	if exists != expectedExists {
+		t.Errorf("expecting exists to be %v, got: %v", expectedExists, exists)
+	}
+
+	exists = Has(idx, "a")
+	expectedExists = true
+	if exists != expectedExists {
+		t.Errorf("expecting exists to be %v, got: %v", expectedExists, exists)
+	}
+
+	exists = Has(idx, "z")
+	expectedExists = false
+	if exists != expectedExists {
+		t.Errorf("expecting exists to be %v, got: %v", expectedExists, exists)
+	}
+
+	filteredIdx := Filter(idx, "a", "b", "c")
+	expectedFilteredIdx := newIndex("a", "b", "c")
+	if !reflect.DeepEqual(filteredIdx, expectedFilteredIdx) {
+		t.Errorf("expecting filtered index to be %v, got: %v", expectedFilteredIdx, filteredIdx)
+	}
+}
+
+func TestDataStructuresDiff(t *testing.T) {
+	tests := []struct {
+		name     string
+		current  Index[string]
+		previous Index[string]
+		wantDiff DiffResult
+	}{
+		{
+			name:     "no diff",
+			current:  newIndex("a", "b"),
+			previous: newIndex("a", "b"),
+			wantDiff: DiffResult{
+				Rest: []string{"a", "b"},
+			},
+		},
+		{
+			name:     "added",
+			current:  newIndex("a", "b", "c", "d"),
+			previous: newIndex("a", "b"),
+			wantDiff: DiffResult{
+				Added: []string{"c", "d"},
+				Rest:  []string{"a", "b"},
+			},
+		},
+		{
+			name:     "deleted",
+			current:  newIndex(),
+			previous: newIndex("a", "b"),
+			wantDiff: DiffResult{
+				Deleted: []string{"a", "b"},
+			},
+		},
+		{
+			name:     "added and deleted",
+			current:  newIndex("b", "d", "e", "f"),
+			previous: newIndex("a", "b", "c"),
+			wantDiff: DiffResult{
+				Added:   []string{"d", "e", "f"},
+				Deleted: []string{"a", "c"},
+				Rest:    []string{"b"},
+			},
+		},
+		{
+			name:     "no intersection",
+			current:  newIndex("d", "e", "f"),
+			previous: newIndex("a", "b", "c"),
+			wantDiff: DiffResult{
+				Added:   []string{"d", "e", "f"},
+				Deleted: []string{"a", "b", "c"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			diff := Diff(tt.current, tt.previous)
+			if !reflect.DeepEqual(tt.wantDiff, diff) {
+				t.Errorf("expecting config to be:\n%v\ngot:\n%v\n", tt.wantDiff, diff)
+			}
+		})
+	}
+}
+
+func TestMerge(t *testing.T) {
+	tests := []struct {
+		name      string
+		slices    [][]string
+		wantSlice []string
+	}{
+		{
+			name: "empty",
+			slices: [][]string{
+				{},
+				nil,
+			},
+			wantSlice: nil,
+		},
+		{
+			name: "half empty",
+			slices: [][]string{
+				{"a", "b", "c"},
+				{},
+			},
+			wantSlice: []string{"a", "b", "c"},
+		},
+		{
+			name: "full",
+			slices: [][]string{
+				{"a", "b", "c"},
+				{"d", "e"},
+			},
+			wantSlice: []string{"a", "b", "c", "d", "e"},
+		},
+		{
+			name: "multiple",
+			slices: [][]string{
+				{"a", "b", "c"},
+				{"d", "e"},
+				{"f", "g", "h"},
+				{"i"},
+			},
+			wantSlice: []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			slices := Merge(tt.slices...)
+			if !reflect.DeepEqual(slices, tt.wantSlice) {
+				t.Errorf("expecting merged slices to be:\n%v\ngot:\n%v\n", tt.wantSlice, slices)
+			}
+		})
+	}
+}
+
+func TestUnique(t *testing.T) {
+	tests := []struct {
+		name         string
+		elements     []string
+		wantElements []string
+	}{
+		{
+			name:         "empty",
+			elements:     nil,
+			wantElements: nil,
+		},
+		{
+			name:         "some repeated",
+			elements:     []string{"a", "b", "b", "c"},
+			wantElements: []string{"a", "b", "c"},
+		},
+		{
+			name:         "multiple repeated",
+			elements:     []string{"a", "b", "b", "c", "d", "d", "d", "e"},
+			wantElements: []string{"a", "b", "c", "d", "e"},
+		},
+		{
+			name:         "all different",
+			elements:     []string{"a", "b", "c", "d", "e"},
+			wantElements: []string{"a", "b", "c", "d", "e"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			elements := Unique(tt.wantElements...)
+			if !reflect.DeepEqual(elements, tt.wantElements) {
+				t.Errorf("expecting unique elements to be:\n%v\ngot:\n%v\n", tt.wantElements, elements)
+			}
+		})
+	}
+}
+
+func TestFind(t *testing.T) {
+	tests := []struct {
+		name        string
+		elements    []string
+		fn          func(string) bool
+		wantElement *string
+	}{
+		{
+			name:        "empty",
+			elements:    nil,
+			fn:          nil,
+			wantElement: nil,
+		},
+		{
+			name:        "not found",
+			elements:    []string{"a", "b", "c"},
+			fn:          func(s string) bool { return s == "d" },
+			wantElement: nil,
+		},
+		{
+			name:        "found",
+			elements:    []string{"a", "b", "c"},
+			fn:          func(s string) bool { return s == "b" },
+			wantElement: ptr.To("b"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			element := Find(tt.elements, tt.fn)
+			if !reflect.DeepEqual(element, tt.wantElement) {
+				t.Errorf("expecting Find returned value to be:\n%v\ngot:\n%v\n", tt.wantElement, element)
+			}
+		})
+	}
+}
+
+func TestAny(t *testing.T) {
+	tests := []struct {
+		name     string
+		elements []string
+		fn       func(string) bool
+		wantBool bool
+	}{
+		{
+			name:     "empty",
+			elements: nil,
+			fn:       nil,
+			wantBool: false,
+		},
+		{
+			name: "no match",
+			elements: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+			},
+			fn:       func(s string) bool { return strings.HasPrefix(s, "--databases") },
+			wantBool: false,
+		},
+		{
+			name: "single match",
+			elements: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--databases foo",
+			},
+			fn:       func(s string) bool { return strings.HasPrefix(s, "--databases") },
+			wantBool: true,
+		},
+		{
+			name: "multiple match",
+			elements: []string{
+				"--single-transaction",
+				"--databases foo",
+				"--events",
+				"--routines",
+				"--databases foo",
+			},
+			fn:       func(s string) bool { return strings.HasPrefix(s, "--databases") },
+			wantBool: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotBool := Any(tt.elements, tt.fn)
+			if !reflect.DeepEqual(gotBool, tt.wantBool) {
+				t.Errorf("expecting Any returned value to be:\n%v\ngot:\n%v\n", tt.wantBool, gotBool)
+			}
+		})
+	}
+}
+
+func TestUniqueArgs(t *testing.T) {
+	tests := []struct {
+		name         string
+		args         []string
+		wantElements []string
+	}{
+		{
+			name:         "empty",
+			args:         nil,
+			wantElements: nil,
+		},
+		{
+			name: "no duplicates",
+			args: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+			},
+			wantElements: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+			},
+		},
+		{
+			name: "exact duplicates keep first",
+			args: []string{
+				"--single-transaction",
+				"--events",
+				"--events",
+			},
+			wantElements: []string{
+				"--single-transaction",
+				"--events",
+			},
+		},
+		{
+			name: "flag with value override - user arg wins",
+			args: []string{
+				"--ssl-verify-server-cert",
+				"--events",
+				"--ssl-verify-server-cert=0",
+			},
+			wantElements: []string{
+				"--events",
+				"--ssl-verify-server-cert=0",
+			},
+		},
+		{
+			name: "exact duplicates preserve order user override wins",
+			args: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--ssl",
+				"--ssl-verify-server-cert",
+				// user args - exact duplicate of --events, override of --ssl-verify-server-cert
+				"--ssl-verify-server-cert=0",
+				"--events",
+			},
+			wantElements: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--ssl",
+				"--ssl-verify-server-cert=0",
+			},
+		},
+		{
+			name: "multiple value overrides keep last",
+			args: []string{
+				"--timeout=30",
+				"--retries=3",
+				"--timeout=60",
+			},
+			wantElements: []string{
+				"--retries=3",
+				"--timeout=60",
+			},
+		},
+		{
+			name: "non-flag args preserved",
+			args: []string{
+				"backup",
+				"--verbose",
+				"restore",
+			},
+			wantElements: []string{
+				"backup",
+				"--verbose",
+				"restore",
+			},
+		},
+		{
+			// mariadb-dump's --ignore-table is repeatable: each instance adds
+			// another table to ignore. UniqueArgs must not collapse distinct
+			// values (#1691).
+			name: "repeatable --ignore-table flags are preserved",
+			args: []string{
+				"--single-transaction",
+				"--all-databases",
+				"--ignore-table=mysql.help_category",
+				"--ignore-table=mysql.help_relation",
+				"--ignore-table=mysql.help_topic",
+			},
+			wantElements: []string{
+				"--single-transaction",
+				"--all-databases",
+				"--ignore-table=mysql.help_category",
+				"--ignore-table=mysql.help_relation",
+				"--ignore-table=mysql.help_topic",
+			},
+		},
+		{
+			// Operator-injected --ignore-table defaults (global_priv, Galera
+			// wsrep_*) must survive alongside user-supplied --ignore-table args
+			// instead of being collapsed to a single value (#1757).
+			name: "operator and user --ignore-table flags coexist",
+			args: []string{
+				"--all-databases",
+				"--ignore-table=mysql.global_priv",
+				"--ignore-table=mysql.wsrep_cluster",
+				"--ignore-table=mysql.wsrep_streaming_log",
+				"--ignore-table=wordpress.custom",
+			},
+			wantElements: []string{
+				"--all-databases",
+				"--ignore-table=mysql.global_priv",
+				"--ignore-table=mysql.wsrep_cluster",
+				"--ignore-table=mysql.wsrep_streaming_log",
+				"--ignore-table=wordpress.custom",
+			},
+		},
+		{
+			// Exact-string repeats of a repeatable flag are still collapsed so we
+			// don't grow argv when defaults overlap with user args.
+			name: "repeatable flag exact duplicates are collapsed",
+			args: []string{
+				"--ignore-table=mysql.global_priv",
+				"--ignore-table=mysql.help_category",
+				"--ignore-table=mysql.global_priv",
+			},
+			wantElements: []string{
+				"--ignore-table=mysql.global_priv",
+				"--ignore-table=mysql.help_category",
+			},
+		},
+		{
+			name: "repeatable --ignore-table-data flags are preserved",
+			args: []string{
+				"--ignore-table-data=db_c.t1",
+				"--ignore-table-data=db_c.t2",
+			},
+			wantElements: []string{
+				"--ignore-table-data=db_c.t1",
+				"--ignore-table-data=db_c.t2",
+			},
+		},
+		{
+			name: "mixed exact and value duplicates",
+			args: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--all-databases",
+				"--skip-add-locks",
+				"--events",
+				"--all-databases",
+				"--skip-add-locks",
+				"--ignore-table=mysql.global_priv",
+				"--verbose",
+			},
+			wantElements: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--all-databases",
+				"--skip-add-locks",
+				"--ignore-table=mysql.global_priv",
+				"--verbose",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			elements := UniqueArgs(tt.args...)
+			if !reflect.DeepEqual(elements, tt.wantElements) {
+				t.Errorf("expecting unique args to be:\n%v\ngot:\n%v\n", tt.wantElements, elements)
+			}
+		})
+	}
+}
+
+func TestRemove(t *testing.T) {
+	tests := []struct {
+		name         string
+		elements     []string
+		fn           func(string) bool
+		wantElements []string
+	}{
+		{
+			name:         "empty",
+			elements:     nil,
+			fn:           nil,
+			wantElements: nil,
+		},
+		{
+			name: "no match",
+			elements: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+			},
+			fn: func(s string) bool { return strings.HasPrefix(s, "--databases") },
+			wantElements: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+			},
+		},
+		{
+			name: "remove first",
+			elements: []string{
+				"--databases foo",
+				"--single-transaction",
+				"--events",
+				"--routines",
+			},
+			fn: func(s string) bool { return strings.HasPrefix(s, "--databases") },
+			wantElements: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+			},
+		},
+		{
+			name: "remove middle",
+			elements: []string{
+				"--single-transaction",
+				"--databases foo",
+				"--events",
+				"--routines",
+			},
+			fn: func(s string) bool { return strings.HasPrefix(s, "--databases") },
+			wantElements: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+			},
+		},
+		{
+			name: "remove last",
+			elements: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--databases foo",
+			},
+			fn: func(s string) bool { return strings.HasPrefix(s, "--databases") },
+			wantElements: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+			},
+		},
+		{
+			name: "multiple match",
+			elements: []string{
+				"--databases foo",
+				"--single-transaction",
+				"--databases foo",
+				"--events",
+				"--routines",
+				"--databases foo",
+			},
+			fn: func(s string) bool { return strings.HasPrefix(s, "--databases") },
+			wantElements: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			elements := Remove(tt.elements, tt.fn)
+			if !reflect.DeepEqual(elements, tt.wantElements) {
+				t.Errorf("expecting Remove returned value to be:\n%v\ngot:\n%v\n", tt.wantElements, elements)
+			}
+		})
+	}
+}
+
+func newIndex(items ...string) Index[string] {
+	return NewIndex[string](items, func(s string) string {
+		return s
+	})
+}

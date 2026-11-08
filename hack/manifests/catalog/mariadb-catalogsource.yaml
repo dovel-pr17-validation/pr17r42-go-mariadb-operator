@@ -1,0 +1,13 @@
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: mariadb-catalog
+  namespace: openshift-marketplace
+spec:
+  sourceType: grpc
+  displayName: MariaDB Catalog
+  image: catalog:latest
+  publisher: MariaDB Corporation
+  updateStrategy:
+    registryPoll:
+      interval: 30m

@@ -1,0 +1,838 @@
+package builder
+
+import (
+	"reflect"
+	"testing"
+
+	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
+	galeraresources "github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/galera/resources"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/discovery"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/metadata"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/version"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+func TestMariadbImagePullSecrets(t *testing.T) {
+	builder := newDefaultTestBuilder(t)
+	objMeta := metav1.ObjectMeta{
+		Name:      "mariadb-image-pull-secrets",
+		Namespace: "test",
+	}
+
+	tests := []struct {
+		name            string
+		mariadb         *mariadbv1alpha1.MariaDB
+		wantPullSecrets []corev1.LocalObjectReference
+	}{
+		{
+			name: "No Secrets",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					UpdateStrategy: mariadbv1alpha1.UpdateStrategy{
+						Type: mariadbv1alpha1.ReplicasFirstPrimaryLastUpdateType,
+					},
+				},
+			},
+			wantPullSecrets: nil,
+		},
+		{
+			name: "Secrets in MariaDB",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					MariaDBPodTemplate: mariadbv1alpha1.MariaDBPodTemplate{
+						ImagePullSecrets: []mariadbv1alpha1.LocalObjectReference{
+							{
+								Name: "mariadb-registry",
+							},
+						},
+					},
+					UpdateStrategy: mariadbv1alpha1.UpdateStrategy{
+						Type: mariadbv1alpha1.ReplicasFirstPrimaryLastUpdateType,
+					},
+				},
+			},
+			wantPullSecrets: []corev1.LocalObjectReference{
+				{
+					Name: "mariadb-registry",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			job, err := builder.BuildMariadbStatefulSet(tt.mariadb, client.ObjectKeyFromObject(tt.mariadb), nil, nil)
+			if err != nil {
+				t.Fatalf("unexpected error building StatefulSet: %v", err)
+			}
+			if !reflect.DeepEqual(tt.wantPullSecrets, job.Spec.Template.Spec.ImagePullSecrets) {
+				t.Errorf("unexpected ImagePullSecrets, want: %v  got: %v", tt.wantPullSecrets, job.Spec.Template.Spec.ImagePullSecrets)
+			}
+		})
+	}
+}
+
+func TestMaxScaleImagePullSecrets(t *testing.T) {
+	builder := newDefaultTestBuilder(t)
+	objMeta := metav1.ObjectMeta{
+		Name:      "maxscale-image-pull-secrets",
+		Namespace: "test",
+	}
+
+	tests := []struct {
+		name            string
+		maxScale        *mariadbv1alpha1.MaxScale
+		wantPullSecrets []corev1.LocalObjectReference
+	}{
+		{
+			name: "No Secrets",
+			maxScale: &mariadbv1alpha1.MaxScale{
+				ObjectMeta: objMeta,
+				Spec:       mariadbv1alpha1.MaxScaleSpec{},
+			},
+			wantPullSecrets: nil,
+		},
+		{
+			name: "Secrets in MaxScale",
+			maxScale: &mariadbv1alpha1.MaxScale{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MaxScaleSpec{
+					MaxScalePodTemplate: mariadbv1alpha1.MaxScalePodTemplate{
+						ImagePullSecrets: []mariadbv1alpha1.LocalObjectReference{
+							{
+								Name: "maxscale-registry",
+							},
+						},
+					},
+				},
+			},
+			wantPullSecrets: []corev1.LocalObjectReference{
+				{
+					Name: "maxscale-registry",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			job, err := builder.BuildMaxscaleStatefulSet(tt.maxScale, client.ObjectKeyFromObject(tt.maxScale), nil)
+			if err != nil {
+				t.Fatalf("unexpected error building StatefulSet: %v", err)
+			}
+			if !reflect.DeepEqual(tt.wantPullSecrets, job.Spec.Template.Spec.ImagePullSecrets) {
+				t.Errorf("unexpected ImagePullSecrets, want: %v  got: %v", tt.wantPullSecrets, job.Spec.Template.Spec.ImagePullSecrets)
+			}
+		})
+	}
+}
+
+func TestMariaDBStatefulSetMeta(t *testing.T) {
+	builder := newDefaultTestBuilder(t)
+	objMeta := metav1.ObjectMeta{
+		Name: "mariadb-obj",
+	}
+	key := types.NamespacedName{
+		Name: "mariadb-obj",
+	}
+	tests := []struct {
+		name           string
+		mariadb        *mariadbv1alpha1.MariaDB
+		podAnnotations map[string]string
+		wantMeta       *mariadbv1alpha1.Metadata
+		wantPodMeta    *mariadbv1alpha1.Metadata
+	}{
+		{
+			name: "empty",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					UpdateStrategy: mariadbv1alpha1.UpdateStrategy{
+						Type: mariadbv1alpha1.ReplicasFirstPrimaryLastUpdateType,
+					},
+				},
+			},
+			podAnnotations: nil,
+			wantMeta: &mariadbv1alpha1.Metadata{
+				Labels:      map[string]string{},
+				Annotations: map[string]string{},
+			},
+			wantPodMeta: &mariadbv1alpha1.Metadata{
+				Labels: map[string]string{
+					"app.kubernetes.io/instance": "mariadb-obj",
+					"app.kubernetes.io/name":     "mariadb",
+				},
+				Annotations: map[string]string{},
+			},
+		},
+		{
+			name: "inherit meta",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					InheritMetadata: &mariadbv1alpha1.Metadata{
+						Labels: map[string]string{
+							"sidecar.istio.io/inject": "false",
+						},
+						Annotations: map[string]string{
+							"database.myorg.io": "mariadb",
+						},
+					},
+					UpdateStrategy: mariadbv1alpha1.UpdateStrategy{
+						Type: mariadbv1alpha1.ReplicasFirstPrimaryLastUpdateType,
+					},
+				},
+			},
+			podAnnotations: nil,
+			wantMeta: &mariadbv1alpha1.Metadata{
+				Labels: map[string]string{
+					"sidecar.istio.io/inject": "false",
+				},
+				Annotations: map[string]string{
+					"database.myorg.io": "mariadb",
+				},
+			},
+			wantPodMeta: &mariadbv1alpha1.Metadata{
+				Labels: map[string]string{
+					"sidecar.istio.io/inject":    "false",
+					"app.kubernetes.io/instance": "mariadb-obj",
+					"app.kubernetes.io/name":     "mariadb",
+				},
+				Annotations: map[string]string{
+					"database.myorg.io": "mariadb",
+				},
+			},
+		},
+		{
+			name: "HA",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Galera: &mariadbv1alpha1.Galera{
+						Enabled: true,
+					},
+					UpdateStrategy: mariadbv1alpha1.UpdateStrategy{
+						Type: mariadbv1alpha1.ReplicasFirstPrimaryLastUpdateType,
+					},
+				},
+			},
+			podAnnotations: nil,
+			wantMeta: &mariadbv1alpha1.Metadata{
+				Labels: map[string]string{},
+				Annotations: map[string]string{
+					"k8s.mariadb.com/mariadb": "mariadb-obj",
+					"k8s.mariadb.com/galera":  "",
+				},
+			},
+			wantPodMeta: &mariadbv1alpha1.Metadata{
+				Labels: map[string]string{
+					"app.kubernetes.io/instance": "mariadb-obj",
+					"app.kubernetes.io/name":     "mariadb",
+				},
+				Annotations: map[string]string{
+					"k8s.mariadb.com/mariadb": "mariadb-obj",
+					"k8s.mariadb.com/galera":  "",
+				},
+			},
+		},
+		{
+			name: "Pod annotations",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					MariaDBPodTemplate: mariadbv1alpha1.MariaDBPodTemplate{
+						PodMetadata: &mariadbv1alpha1.Metadata{
+							Annotations: map[string]string{
+								"k8s.mariadb.com/pod-meta": "pod-meta",
+							},
+						},
+					},
+					UpdateStrategy: mariadbv1alpha1.UpdateStrategy{
+						Type: mariadbv1alpha1.ReplicasFirstPrimaryLastUpdateType,
+					},
+				},
+			},
+			podAnnotations: map[string]string{
+				"k8s.mariadb.com/config": "config-hash",
+			},
+			wantMeta: &mariadbv1alpha1.Metadata{
+				Labels:      map[string]string{},
+				Annotations: map[string]string{},
+			},
+			wantPodMeta: &mariadbv1alpha1.Metadata{
+				Labels: map[string]string{
+					"app.kubernetes.io/instance": "mariadb-obj",
+					"app.kubernetes.io/name":     "mariadb",
+				},
+				Annotations: map[string]string{
+					"k8s.mariadb.com/pod-meta": "pod-meta",
+					"k8s.mariadb.com/config":   "config-hash",
+				},
+			},
+		},
+		{
+			name: "all",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					InheritMetadata: &mariadbv1alpha1.Metadata{
+						Labels: map[string]string{
+							"database.myorg.io": "mariadb",
+						},
+						Annotations: map[string]string{
+							"database.myorg.io": "mariadb",
+						},
+					},
+					Galera: &mariadbv1alpha1.Galera{
+						Enabled: true,
+					},
+					MariaDBPodTemplate: mariadbv1alpha1.MariaDBPodTemplate{
+						PodMetadata: &mariadbv1alpha1.Metadata{
+							Annotations: map[string]string{
+								"k8s.mariadb.com/pod-meta": "pod-meta",
+							},
+						},
+					},
+					UpdateStrategy: mariadbv1alpha1.UpdateStrategy{
+						Type: mariadbv1alpha1.ReplicasFirstPrimaryLastUpdateType,
+					},
+				},
+			},
+			podAnnotations: map[string]string{
+				"k8s.mariadb.com/config": "config-hash",
+			},
+			wantMeta: &mariadbv1alpha1.Metadata{
+				Labels: map[string]string{
+					"database.myorg.io": "mariadb",
+				},
+				Annotations: map[string]string{
+					"database.myorg.io":       "mariadb",
+					"k8s.mariadb.com/mariadb": "mariadb-obj",
+					"k8s.mariadb.com/galera":  "",
+				},
+			},
+			wantPodMeta: &mariadbv1alpha1.Metadata{
+				Labels: map[string]string{
+					"database.myorg.io":          "mariadb",
+					"app.kubernetes.io/instance": "mariadb-obj",
+					"app.kubernetes.io/name":     "mariadb",
+				},
+				Annotations: map[string]string{
+					"database.myorg.io":        "mariadb",
+					"k8s.mariadb.com/mariadb":  "mariadb-obj",
+					"k8s.mariadb.com/galera":   "",
+					"k8s.mariadb.com/pod-meta": "pod-meta",
+					"k8s.mariadb.com/config":   "config-hash",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sts, err := builder.BuildMariadbStatefulSet(tt.mariadb, key, tt.podAnnotations, nil)
+			if err != nil {
+				t.Fatalf("unexpected error building MariaDB StatefulSet: %v", err)
+			}
+			assertObjectMeta(t, &sts.ObjectMeta, tt.wantMeta.Labels, tt.wantMeta.Annotations)
+			assertObjectMeta(t, &sts.Spec.Template.ObjectMeta, tt.wantPodMeta.Labels, tt.wantPodMeta.Annotations)
+		})
+	}
+}
+
+func TestMariaDBUpdateStrategy(t *testing.T) {
+	objMeta := metav1.ObjectMeta{
+		Name: "mariadb-obj",
+	}
+	tests := []struct {
+		name               string
+		mariadb            *mariadbv1alpha1.MariaDB
+		wantUpdateStrategy *appsv1.StatefulSetUpdateStrategy
+		wantErr            bool
+	}{
+		{
+			name: "empty",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+			},
+			wantUpdateStrategy: nil,
+			wantErr:            true,
+		},
+		{
+			name: "replicas first primary last",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					UpdateStrategy: mariadbv1alpha1.UpdateStrategy{
+						Type: mariadbv1alpha1.ReplicasFirstPrimaryLastUpdateType,
+					},
+				},
+			},
+			wantUpdateStrategy: &appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.OnDeleteStatefulSetStrategyType,
+			},
+			wantErr: false,
+		},
+		{
+			name: "rolling update",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					UpdateStrategy: mariadbv1alpha1.UpdateStrategy{
+						Type: mariadbv1alpha1.RollingUpdateUpdateType,
+						RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{
+							MaxUnavailable: ptr.To(intstr.FromInt(1)),
+						},
+					},
+				},
+			},
+			wantUpdateStrategy: &appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{
+					MaxUnavailable: ptr.To(intstr.FromInt(1)),
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "on delete",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					UpdateStrategy: mariadbv1alpha1.UpdateStrategy{
+						Type: mariadbv1alpha1.OnDeleteUpdateType,
+					},
+				},
+			},
+			wantUpdateStrategy: &appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.OnDeleteStatefulSetStrategyType,
+			},
+			wantErr: false,
+		},
+		{
+			name: "never",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					UpdateStrategy: mariadbv1alpha1.UpdateStrategy{
+						Type: mariadbv1alpha1.NeverUpdateType,
+					},
+				},
+			},
+			wantUpdateStrategy: &appsv1.StatefulSetUpdateStrategy{},
+			wantErr:            false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stsStrategy, err := mariadbUpdateStrategy(tt.mariadb)
+			if !tt.wantErr && err != nil {
+				t.Errorf("unexpected error building update strategy: %v", err)
+			}
+			if tt.wantErr && err == nil {
+				t.Errorf("expected error building update strategy, got nil")
+			}
+			if !reflect.DeepEqual(tt.wantUpdateStrategy, stsStrategy) {
+				t.Errorf("expecting mariadbUpdateStrategy returned value to be:\n%v\ngot:\n%v\n", tt.wantUpdateStrategy, stsStrategy)
+			}
+		})
+	}
+}
+
+func TestMariaDBPVCRetentionPolicy(t *testing.T) {
+	tests := []struct {
+		name       string
+		gitVersion string
+		wantSet    bool
+	}{
+		{
+			name:       "supported kubernetes version",
+			gitVersion: "v1.32.0",
+			wantSet:    true,
+		},
+		{
+			name:       "unsupported kubernetes version",
+			gitVersion: "v1.31.0",
+			wantSet:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			discoveryClient, err := discovery.NewFakeDiscoveryWithServerVersion(&version.Info{
+				GitVersion: tt.gitVersion,
+			})
+			if err != nil {
+				t.Fatalf("unexpected error creating discovery: %v", err)
+			}
+			builder := newTestBuilder(discoveryClient)
+			mariadb := &mariadbv1alpha1.MariaDB{
+				ObjectMeta: metav1.ObjectMeta{Name: "mariadb-obj"},
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					UpdateStrategy: mariadbv1alpha1.UpdateStrategy{
+						Type: mariadbv1alpha1.RollingUpdateUpdateType,
+					},
+					Storage: mariadbv1alpha1.Storage{
+						PVCRetentionPolicy: &mariadbv1alpha1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+							WhenDeleted: mariadbv1alpha1.PersistentVolumeClaimRetentionPolicyDelete,
+							WhenScaled:  mariadbv1alpha1.PersistentVolumeClaimRetentionPolicyRetain,
+						},
+					},
+				},
+			}
+
+			sts, err := builder.BuildMariadbStatefulSet(mariadb, client.ObjectKeyFromObject(mariadb), nil, nil)
+			if err != nil {
+				t.Fatalf("unexpected error building StatefulSet: %v", err)
+			}
+
+			if tt.wantSet {
+				if sts.Spec.PersistentVolumeClaimRetentionPolicy == nil {
+					t.Fatal("expected pvcRetentionPolicy to be set")
+				}
+				if sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted != appsv1.DeletePersistentVolumeClaimRetentionPolicyType {
+					t.Errorf("unexpected whenDeleted value: %v", sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted)
+				}
+				if sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled != appsv1.RetainPersistentVolumeClaimRetentionPolicyType {
+					t.Errorf("unexpected whenScaled value: %v", sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled)
+				}
+			} else if sts.Spec.PersistentVolumeClaimRetentionPolicy != nil {
+				t.Fatal("expected pvcRetentionPolicy to be omitted for unsupported versions")
+			}
+		})
+	}
+}
+
+func TestMaxScaleStatefulSetMeta(t *testing.T) {
+	builder := newDefaultTestBuilder(t)
+	objMeta := metav1.ObjectMeta{
+		Name: "maxscale-obj",
+	}
+	key := types.NamespacedName{
+		Name: "maxscale-obj",
+	}
+	tests := []struct {
+		name           string
+		maxscale       *mariadbv1alpha1.MaxScale
+		podAnnotations map[string]string
+		wantMeta       *mariadbv1alpha1.Metadata
+		wantPodMeta    *mariadbv1alpha1.Metadata
+	}{
+		{
+			name: "empty",
+			maxscale: &mariadbv1alpha1.MaxScale{
+				ObjectMeta: objMeta,
+			},
+			podAnnotations: nil,
+			wantMeta: &mariadbv1alpha1.Metadata{
+				Labels:      map[string]string{},
+				Annotations: map[string]string{},
+			},
+			wantPodMeta: &mariadbv1alpha1.Metadata{
+				Labels: map[string]string{
+					"app.kubernetes.io/instance": "maxscale-obj",
+					"app.kubernetes.io/name":     "maxscale",
+				},
+				Annotations: map[string]string{},
+			},
+		},
+		{
+			name: "inherit meta",
+			maxscale: &mariadbv1alpha1.MaxScale{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MaxScaleSpec{
+					InheritMetadata: &mariadbv1alpha1.Metadata{
+						Labels: map[string]string{
+							"sidecar.istio.io/inject": "false",
+						},
+						Annotations: map[string]string{
+							"database.myorg.io": "mariadb",
+						},
+					},
+				},
+			},
+			podAnnotations: nil,
+			wantMeta: &mariadbv1alpha1.Metadata{
+				Labels: map[string]string{
+					"sidecar.istio.io/inject": "false",
+				},
+				Annotations: map[string]string{
+					"database.myorg.io": "mariadb",
+				},
+			},
+			wantPodMeta: &mariadbv1alpha1.Metadata{
+				Labels: map[string]string{
+					"app.kubernetes.io/instance": "maxscale-obj",
+					"app.kubernetes.io/name":     "maxscale",
+					"sidecar.istio.io/inject":    "false",
+				},
+				Annotations: map[string]string{
+					"database.myorg.io": "mariadb",
+				},
+			},
+		},
+		{
+			name: "Pod annotations",
+			maxscale: &mariadbv1alpha1.MaxScale{
+				ObjectMeta: objMeta,
+			},
+			podAnnotations: map[string]string{
+				metadata.TLSServerCertAnnotation: "cert",
+			},
+			wantMeta: &mariadbv1alpha1.Metadata{
+				Labels:      map[string]string{},
+				Annotations: map[string]string{},
+			},
+			wantPodMeta: &mariadbv1alpha1.Metadata{
+				Labels: map[string]string{
+					"app.kubernetes.io/instance": "maxscale-obj",
+					"app.kubernetes.io/name":     "maxscale",
+				},
+				Annotations: map[string]string{
+					metadata.TLSServerCertAnnotation: "cert",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sts, err := builder.BuildMaxscaleStatefulSet(tt.maxscale, key, tt.podAnnotations)
+			if err != nil {
+				t.Fatalf("unexpected error building MaxScale StatefulSet: %v", err)
+			}
+			assertObjectMeta(t, &sts.ObjectMeta, tt.wantMeta.Labels, tt.wantMeta.Annotations)
+			assertObjectMeta(t, &sts.Spec.Template.ObjectMeta, tt.wantPodMeta.Labels, tt.wantPodMeta.Annotations)
+		})
+	}
+}
+
+func TestMariaDBVolumeClaimTemplates(t *testing.T) {
+	objMeta := metav1.ObjectMeta{
+		Name: "mariadb-obj",
+	}
+	tests := []struct {
+		name        string
+		mariadb     *mariadbv1alpha1.MariaDB
+		wantVolumes []string
+	}{
+		{
+			name: "ephemeral",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Storage: mariadbv1alpha1.Storage{
+						Ephemeral: ptr.To(true),
+					},
+				},
+			},
+			wantVolumes: []string{},
+		},
+		{
+			name: "standalone",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Storage: mariadbv1alpha1.Storage{
+						Size: ptr.To(resource.MustParse("1Gi")),
+						VolumeClaimTemplate: &mariadbv1alpha1.VolumeClaimTemplate{
+							PersistentVolumeClaimSpec: mariadbv1alpha1.PersistentVolumeClaimSpec{
+								Resources: corev1.VolumeResourceRequirements{
+									Requests: corev1.ResourceList{
+										"storage": resource.MustParse("1Gi"),
+									},
+								},
+								AccessModes: []corev1.PersistentVolumeAccessMode{
+									corev1.ReadWriteOnce,
+								},
+							},
+						},
+					},
+				},
+			},
+			wantVolumes: []string{StorageVolume},
+		},
+		{
+			name: "replication",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Storage: mariadbv1alpha1.Storage{
+						Size: ptr.To(resource.MustParse("1Gi")),
+						VolumeClaimTemplate: &mariadbv1alpha1.VolumeClaimTemplate{
+							PersistentVolumeClaimSpec: mariadbv1alpha1.PersistentVolumeClaimSpec{
+								Resources: corev1.VolumeResourceRequirements{
+									Requests: corev1.ResourceList{
+										"storage": resource.MustParse("1Gi"),
+									},
+								},
+								AccessModes: []corev1.PersistentVolumeAccessMode{
+									corev1.ReadWriteOnce,
+								},
+							},
+						},
+					},
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+				},
+			},
+			wantVolumes: []string{StorageVolume},
+		},
+		{
+			name: "galera",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Storage: mariadbv1alpha1.Storage{
+						Size: ptr.To(resource.MustParse("1Gi")),
+						VolumeClaimTemplate: &mariadbv1alpha1.VolumeClaimTemplate{
+							PersistentVolumeClaimSpec: mariadbv1alpha1.PersistentVolumeClaimSpec{
+								Resources: corev1.VolumeResourceRequirements{
+									Requests: corev1.ResourceList{
+										"storage": resource.MustParse("1Gi"),
+									},
+								},
+								AccessModes: []corev1.PersistentVolumeAccessMode{
+									corev1.ReadWriteOnce,
+								},
+							},
+						},
+					},
+					Galera: &mariadbv1alpha1.Galera{
+						Enabled: true,
+						GaleraSpec: mariadbv1alpha1.GaleraSpec{
+							Config: mariadbv1alpha1.GaleraConfig{
+								VolumeClaimTemplate: &mariadbv1alpha1.VolumeClaimTemplate{
+									PersistentVolumeClaimSpec: mariadbv1alpha1.PersistentVolumeClaimSpec{
+										Resources: corev1.VolumeResourceRequirements{
+											Requests: corev1.ResourceList{
+												"storage": resource.MustParse("1Gi"),
+											},
+										},
+										AccessModes: []corev1.PersistentVolumeAccessMode{
+											corev1.ReadWriteOnce,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			wantVolumes: []string{StorageVolume, galeraresources.GaleraConfigVolume},
+		},
+		{
+			name: "galera reuse storage",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: objMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Storage: mariadbv1alpha1.Storage{
+						Size: ptr.To(resource.MustParse("1Gi")),
+						VolumeClaimTemplate: &mariadbv1alpha1.VolumeClaimTemplate{
+							PersistentVolumeClaimSpec: mariadbv1alpha1.PersistentVolumeClaimSpec{
+								Resources: corev1.VolumeResourceRequirements{
+									Requests: corev1.ResourceList{
+										"storage": resource.MustParse("1Gi"),
+									},
+								},
+								AccessModes: []corev1.PersistentVolumeAccessMode{
+									corev1.ReadWriteOnce,
+								},
+							},
+						},
+					},
+					Galera: &mariadbv1alpha1.Galera{
+						Enabled: true,
+						GaleraSpec: mariadbv1alpha1.GaleraSpec{
+							Config: mariadbv1alpha1.GaleraConfig{
+								ReuseStorageVolume: ptr.To(true),
+							},
+						},
+					},
+				},
+			},
+			wantVolumes: []string{StorageVolume},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pvcs := mariadbVolumeClaimTemplates(tt.mariadb)
+			if len(pvcs) != len(tt.wantVolumes) {
+				t.Errorf("unexpected number of PVCs, got: %v, want: %v", len(pvcs), len(tt.wantVolumes))
+			}
+			for _, wantVolume := range tt.wantVolumes {
+				if !hasVolume(pvcs, wantVolume) {
+					t.Errorf("expecting Volume \"%s\", but it was not found", wantVolume)
+				}
+			}
+		})
+	}
+}
+
+func TestStorageVolumeAttributesClassName(t *testing.T) {
+	builder := newDefaultTestBuilder(t)
+	for _, tt := range []struct {
+		name  string
+		class *string
+	}{
+		{name: "omitted"},
+		{name: "empty", class: ptr.To("")},
+		{name: "configured", class: ptr.To("high-performance")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mdb := &mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Storage: mariadbv1alpha1.Storage{
+						VolumeClaimTemplate: &mariadbv1alpha1.VolumeClaimTemplate{
+							PersistentVolumeClaimSpec: mariadbv1alpha1.PersistentVolumeClaimSpec{
+								VolumeAttributesClassName: tt.class,
+							},
+						},
+					},
+				},
+			}
+			for _, size := range []string{"1Gi", "2Gi"} {
+				mdb.Spec.Storage.Size = ptr.To(resource.MustParse(size))
+				mdb.Spec.Storage.SetDefaults()
+				mdb.Spec.Storage.SetDefaults()
+				pvcs := mariadbVolumeClaimTemplates(mdb)
+				if len(pvcs) != 1 {
+					t.Fatalf("expected one storage PVC template, got %d", len(pvcs))
+				}
+				pvc, err := builder.BuildStoragePVC(types.NamespacedName{Name: "storage-test"}, mdb.Spec.Storage.VolumeClaimTemplate, mdb)
+				if err != nil {
+					t.Fatalf("unexpected error building storage PVC: %v", err)
+				}
+				for _, spec := range []corev1.PersistentVolumeClaimSpec{pvcs[0].Spec, pvc.Spec} {
+					if !reflect.DeepEqual(spec.VolumeAttributesClassName, tt.class) {
+						t.Errorf("volume attributes class not preserved for size %s: got %v, want %v", size, spec.VolumeAttributesClassName, tt.class)
+					}
+					if got := spec.Resources.Requests[corev1.ResourceStorage]; got.Cmp(*mdb.Spec.Storage.Size) != 0 {
+						t.Errorf("unexpected storage size: got %s, want %s", got.String(), size)
+					}
+				}
+			}
+		})
+	}
+}
+
+func hasVolume(pvcs []corev1.PersistentVolumeClaim, volumeName string) bool {
+	for _, p := range pvcs {
+		if p.Name == volumeName {
+			return true
+		}
+	}
+	return false
+}

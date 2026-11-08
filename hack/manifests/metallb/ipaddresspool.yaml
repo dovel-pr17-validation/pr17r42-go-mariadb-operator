@@ -1,0 +1,27 @@
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: load-balancer-0
+  namespace: metallb
+spec:
+  addresses:
+    - $CIDR_PREFIX.0.10-$CIDR_PREFIX.0.240
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: l2advertisement
+  namespace: metallb
+spec:
+  ipAddressPools:
+    - load-balancer-0
+    - load-balancer-1
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: load-balancer-1
+  namespace: metallb
+spec:
+  addresses:
+    - $CIDR_PREFIX.1.10-$CIDR_PREFIX.1.240

@@ -1,0 +1,1710 @@
+package command
+
+import (
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
+	builderpki "github.com/mariadb-operator/mariadb-operator/v26/pkg/builder/pki"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/replication"
+	"github.com/stretchr/testify/assert"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+)
+
+func TestNewBackupCommand(t *testing.T) {
+	tests := []struct {
+		name    string
+		opts    []BackupOpt
+		wantErr bool
+	}{
+		{
+			name: "missing path",
+			opts: []BackupOpt{
+				WithPath("", "/target/file", "/backup/full"),
+				WithUserEnv("USER_ENV"),
+				WithPasswordEnv("PASS_ENV"),
+			},
+			wantErr: true,
+		},
+		{
+			name: "missing target file",
+			opts: []BackupOpt{
+				WithPath("/backups", "", "/backup/full"),
+				WithUserEnv("USER_ENV"),
+				WithPasswordEnv("PASS_ENV"),
+			},
+			wantErr: true,
+		},
+		{
+			name: "missing backup full dir",
+			opts: []BackupOpt{
+				WithPath("/backups", "/target/file", ""),
+				WithUserEnv("USER_ENV"),
+				WithPasswordEnv("PASS_ENV"),
+			},
+			wantErr: true,
+		},
+		{
+			name: "missing user env",
+			opts: []BackupOpt{
+				WithPath("/backups", "/target/file", "/backup/full"),
+				WithPasswordEnv("PASS_ENV"),
+			},
+			wantErr: true,
+		},
+		{
+			name: "missing password env",
+			opts: []BackupOpt{
+				WithPath("/backups", "/target/file", "/backup/full"),
+				WithUserEnv("USER_ENV"),
+			},
+			wantErr: true,
+		},
+		{
+			name: "omit credentials skips user/password check",
+			opts: []BackupOpt{
+				WithPath("/backups", "/target/file", "/backup/full"),
+				WithOmitCredentials(true),
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, err := NewBackupCommand(tt.opts...)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Nil(t, cmd)
+			} else {
+				assert.NoError(t, err)
+				assert.NotNil(t, cmd)
+			}
+		})
+	}
+}
+
+func TestMariadbDumpArgs(t *testing.T) {
+	tests := []struct {
+		name      string
+		backupCmd *BackupCommand
+		backup    *mariadbv1alpha1.Backup
+		mariadb   *mariadbv1alpha1.MariaDB
+		wantArgs  []string
+	}{
+		{
+			name:      "empty",
+			backupCmd: &BackupCommand{},
+			backup:    &mariadbv1alpha1.Backup{},
+			mariadb:   &mariadbv1alpha1.MariaDB{},
+			wantArgs: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--all-databases",
+			},
+		},
+		{
+			name: "extra args",
+			backupCmd: &BackupCommand{
+				BackupOpts{
+					ExtraOpts: []string{
+						"--verbose",
+						"--add-drop-table",
+					},
+				},
+			},
+			backup:  &mariadbv1alpha1.Backup{},
+			mariadb: &mariadbv1alpha1.MariaDB{},
+			wantArgs: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--all-databases",
+				"--verbose",
+				"--add-drop-table",
+			},
+		},
+		{
+			name:      "Galera",
+			backupCmd: &BackupCommand{},
+			backup:    &mariadbv1alpha1.Backup{},
+			mariadb: &mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Galera: &mariadbv1alpha1.Galera{
+						Enabled: true,
+					},
+				},
+			},
+			wantArgs: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--all-databases",
+				"--skip-add-locks",
+				"--ignore-table=mysql.wsrep_cluster",
+				"--ignore-table=mysql.wsrep_cluster_members",
+				"--ignore-table=mysql.wsrep_streaming_log",
+				"--ignore-table=mysql.wsrep_allowlist",
+			},
+		},
+		{
+			name:      "TLS",
+			backupCmd: &BackupCommand{},
+			backup:    &mariadbv1alpha1.Backup{},
+			mariadb: &mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					TLS: &mariadbv1alpha1.TLS{
+						Enabled: true,
+					},
+				},
+			},
+			wantArgs: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--all-databases",
+				"--ssl",
+				"--ssl-ca",
+				builderpki.CACertPath,
+				"--ssl-cert",
+				builderpki.ClientCertPath,
+				"--ssl-key",
+				builderpki.ClientKeyPath,
+				"--ssl-verify-server-cert",
+			},
+		},
+		{
+			name:      "ignore mysql.global_priv",
+			backupCmd: &BackupCommand{},
+			backup: &mariadbv1alpha1.Backup{
+				Spec: mariadbv1alpha1.BackupSpec{
+					IgnoreGlobalPriv: ptr.To(true),
+				},
+			},
+			mariadb: &mariadbv1alpha1.MariaDB{},
+			wantArgs: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--all-databases",
+				"--ignore-table=mysql.global_priv",
+			},
+		},
+		{
+			name: "duplicated args",
+			backupCmd: &BackupCommand{
+				BackupOpts{
+					ExtraOpts: []string{
+						"--events",
+						"--all-databases",
+						"--skip-add-locks",
+						"--ignore-table=mysql.global_priv",
+						"--verbose",
+						"--add-drop-table",
+					},
+				},
+			},
+			backup: &mariadbv1alpha1.Backup{},
+			mariadb: &mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Galera: &mariadbv1alpha1.Galera{
+						Enabled: true,
+					},
+				},
+			},
+			wantArgs: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--all-databases",
+				"--skip-add-locks",
+				"--ignore-table=mysql.wsrep_cluster",
+				"--ignore-table=mysql.wsrep_cluster_members",
+				"--ignore-table=mysql.wsrep_streaming_log",
+				"--ignore-table=mysql.wsrep_allowlist",
+				"--ignore-table=mysql.global_priv",
+				"--verbose",
+				"--add-drop-table",
+			},
+		},
+		{
+			// Galera-managed wsrep_* exclusions (#1757) coexist with the operator's
+			// global_priv exclusion and user-supplied repeatable --ignore-table args (#1758)
+			// instead of collapsing to a single --ignore-table value.
+			name: "Galera wsrep exclusions coexist with user ignore-table",
+			backupCmd: &BackupCommand{
+				BackupOpts{
+					ExtraOpts: []string{
+						"--ignore-table=wordpress.argtest_one",
+						"--ignore-table=wordpress.argtest_two",
+					},
+				},
+			},
+			backup: &mariadbv1alpha1.Backup{
+				Spec: mariadbv1alpha1.BackupSpec{
+					IgnoreGlobalPriv: ptr.To(true),
+				},
+			},
+			mariadb: &mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Galera: &mariadbv1alpha1.Galera{
+						Enabled: true,
+					},
+				},
+			},
+			wantArgs: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--all-databases",
+				"--skip-add-locks",
+				"--ignore-table=mysql.wsrep_cluster",
+				"--ignore-table=mysql.wsrep_cluster_members",
+				"--ignore-table=mysql.wsrep_streaming_log",
+				"--ignore-table=mysql.wsrep_allowlist",
+				"--ignore-table=mysql.global_priv",
+				"--ignore-table=wordpress.argtest_one",
+				"--ignore-table=wordpress.argtest_two",
+			},
+		},
+		{
+			name: "databases via args",
+			backupCmd: &BackupCommand{
+				BackupOpts{
+					ExtraOpts: []string{
+						"--databases db1 db2 db3",
+					},
+				},
+			},
+			backup:  &mariadbv1alpha1.Backup{},
+			mariadb: &mariadbv1alpha1.MariaDB{},
+			wantArgs: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--databases db1 db2 db3",
+			},
+		},
+		{
+			name:      "databases via spec.databases",
+			backupCmd: &BackupCommand{},
+			backup: &mariadbv1alpha1.Backup{
+				Spec: mariadbv1alpha1.BackupSpec{
+					Databases: []string{
+						"db1",
+						"db2",
+						"db3",
+					},
+				},
+			},
+			mariadb: &mariadbv1alpha1.MariaDB{},
+			wantArgs: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--databases db1 db2 db3",
+			},
+		},
+		{
+			name: "override databases via args with spec.databases",
+			backupCmd: &BackupCommand{
+				BackupOpts{
+					ExtraOpts: []string{
+						"--databases foo bar",
+					},
+				},
+			},
+			backup: &mariadbv1alpha1.Backup{
+				Spec: mariadbv1alpha1.BackupSpec{
+					Databases: []string{
+						"db1",
+						"db2",
+						"db3",
+					},
+				},
+			},
+			mariadb: &mariadbv1alpha1.MariaDB{},
+			wantArgs: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--databases db1 db2 db3",
+			},
+		},
+		{
+			name: "override malformed databases via args with spec.databases",
+			backupCmd: &BackupCommand{
+				BackupOpts{
+					ExtraOpts: []string{
+						"      --databases    foo bar",
+					},
+				},
+			},
+			backup: &mariadbv1alpha1.Backup{
+				Spec: mariadbv1alpha1.BackupSpec{
+					Databases: []string{
+						"db1",
+						"db2",
+						"db3",
+					},
+				},
+			},
+			mariadb: &mariadbv1alpha1.MariaDB{},
+			wantArgs: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--databases db1 db2 db3",
+			},
+		},
+		{
+			name: "all",
+			backupCmd: &BackupCommand{
+				BackupOpts{
+					ExtraOpts: []string{
+						"--databases foo bar",
+						"--verbose",
+						"--add-drop-table",
+					},
+				},
+			},
+			backup: &mariadbv1alpha1.Backup{
+				Spec: mariadbv1alpha1.BackupSpec{
+					Databases: []string{
+						"db1",
+						"db2",
+						"db3",
+					},
+					IgnoreGlobalPriv: ptr.To(true),
+				},
+			},
+			mariadb: &mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Galera: &mariadbv1alpha1.Galera{
+						Enabled: true,
+					},
+				},
+			},
+			wantArgs: []string{
+				"--single-transaction",
+				"--events",
+				"--routines",
+				"--databases db1 db2 db3",
+				"--skip-add-locks",
+				"--ignore-table=mysql.wsrep_cluster",
+				"--ignore-table=mysql.wsrep_cluster_members",
+				"--ignore-table=mysql.wsrep_streaming_log",
+				"--ignore-table=mysql.wsrep_allowlist",
+				"--ignore-table=mysql.global_priv",
+				"--verbose",
+				"--add-drop-table",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := tt.backupCmd.mariadbDumpArgs(tt.backup, tt.mariadb)
+			if diff := cmp.Diff(args, tt.wantArgs); diff != "" {
+				t.Errorf("unexpected args (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestMariadbBackupArgs(t *testing.T) {
+	tests := []struct {
+		name           string
+		backupCmd      *BackupCommand
+		mariadb        *mariadbv1alpha1.MariaDB
+		targetPodIndex int
+		wantArgs       []string
+	}{
+		{
+			name:           "default",
+			backupCmd:      &BackupCommand{},
+			mariadb:        &mariadbv1alpha1.MariaDB{},
+			targetPodIndex: 0,
+			wantArgs: []string{
+				"--backup",
+				"--stream=xbstream",
+				"--databases-exclude='lost+found'",
+			},
+		},
+		{
+			name: "with extra opts",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					ExtraOpts: []string{"--compress", "--parallel=2"},
+				},
+			},
+			mariadb:        &mariadbv1alpha1.MariaDB{},
+			targetPodIndex: 0,
+			wantArgs: []string{
+				"--backup",
+				"--stream=xbstream",
+				"--databases-exclude='lost+found'",
+				"--compress",
+				"--parallel=2",
+			},
+		},
+		{
+			name:      "with TLS",
+			backupCmd: &BackupCommand{},
+			mariadb: &mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					TLS: &mariadbv1alpha1.TLS{Enabled: true},
+				},
+			},
+			targetPodIndex: 0,
+			wantArgs: []string{
+				"--backup",
+				"--stream=xbstream",
+				"--databases-exclude='lost+found'",
+				"--ssl",
+				"--ssl-ca",
+				builderpki.CACertPath,
+				"--ssl-cert",
+				builderpki.ClientCertPath,
+				"--ssl-key",
+				builderpki.ClientKeyPath,
+				"--ssl-verify-server-cert",
+			},
+		},
+		{
+			name: "with TLS and extra opts",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					ExtraOpts: []string{"--compress", "--parallel=2"},
+				},
+			},
+			mariadb: &mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					TLS: &mariadbv1alpha1.TLS{Enabled: true},
+				},
+			},
+			targetPodIndex: 0,
+			wantArgs: []string{
+				"--backup",
+				"--stream=xbstream",
+				"--databases-exclude='lost+found'",
+				"--ssl",
+				"--ssl-ca",
+				builderpki.CACertPath,
+				"--ssl-cert",
+				builderpki.ClientCertPath,
+				"--ssl-key",
+				builderpki.ClientKeyPath,
+				"--ssl-verify-server-cert",
+				"--compress",
+				"--parallel=2",
+			},
+		},
+		{
+			name: "duplicate extra opts",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					ExtraOpts: []string{"--compress", "--compress"},
+				},
+			},
+			mariadb:        &mariadbv1alpha1.MariaDB{},
+			targetPodIndex: 0,
+			wantArgs: []string{
+				"--backup",
+				"--stream=xbstream",
+				"--databases-exclude='lost+found'",
+				"--compress",
+			},
+		},
+		{
+			name:      "replication",
+			backupCmd: &BackupCommand{},
+			mariadb: &mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+				},
+				Status: mariadbv1alpha1.MariaDBStatus{
+					CurrentPrimaryPodIndex: ptr.To(1),
+				},
+			},
+			targetPodIndex: 0,
+			wantArgs: []string{
+				"--backup",
+				"--stream=xbstream",
+				"--databases-exclude='lost+found'",
+				"--slave-info",
+				"--safe-slave-backup",
+			},
+		},
+		{
+			// mariadb-backup's --databases-exclude is last-wins, so a user-supplied value
+			// must be merged with the built-in lost+found exclusion into a single flag
+			// instead of overriding it (#1758).
+			name: "user databases-exclude merged with lost+found",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					ExtraOpts: []string{"--databases-exclude=mysql"},
+				},
+			},
+			mariadb:        &mariadbv1alpha1.MariaDB{},
+			targetPodIndex: 0,
+			wantArgs: []string{
+				"--backup",
+				"--stream=xbstream",
+				"--databases-exclude='lost+found mysql'",
+			},
+		},
+		{
+			name: "multiple quoted databases-exclude merged with lost+found",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					ExtraOpts: []string{
+						"--databases-exclude='mysql sys'",
+						"--databases-exclude=test",
+						"--compress",
+					},
+				},
+			},
+			mariadb:        &mariadbv1alpha1.MariaDB{},
+			targetPodIndex: 0,
+			wantArgs: []string{
+				"--backup",
+				"--stream=xbstream",
+				"--databases-exclude='lost+found mysql sys test'",
+				"--compress",
+			},
+		},
+		{
+			// mariadb-backup also accepts the space-separated long-option form, which must
+			// be merged as well instead of overriding lost+found.
+			name: "space-separated databases-exclude merged with lost+found",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					ExtraOpts: []string{"--databases-exclude mysql"},
+				},
+			},
+			mariadb:        &mariadbv1alpha1.MariaDB{},
+			targetPodIndex: 0,
+			wantArgs: []string{
+				"--backup",
+				"--stream=xbstream",
+				"--databases-exclude='lost+found mysql'",
+			},
+		},
+		{
+			// mariadb-backup also accepts the flag and value as two separate argv
+			// elements. That form must be merged too, otherwise the bare user flag would
+			// last-win and silently drop the built-in lost+found exclusion.
+			name: "two-element databases-exclude merged with lost+found",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					ExtraOpts: []string{"--databases-exclude", "mysql", "--compress"},
+				},
+			},
+			mariadb:        &mariadbv1alpha1.MariaDB{},
+			targetPodIndex: 0,
+			wantArgs: []string{
+				"--backup",
+				"--stream=xbstream",
+				"--databases-exclude='lost+found mysql'",
+				"--compress",
+			},
+		},
+		{
+			// Duplicate database names across forms collapse to a single entry, preserving
+			// first-seen order for a deterministic command.
+			name: "duplicate databases-exclude names are deduplicated",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					ExtraOpts: []string{
+						"--databases-exclude=mysql sys",
+						"--databases-exclude",
+						"mysql",
+						"--databases-exclude=lost+found",
+					},
+				},
+			},
+			mariadb:        &mariadbv1alpha1.MariaDB{},
+			targetPodIndex: 0,
+			wantArgs: []string{
+				"--backup",
+				"--stream=xbstream",
+				"--databases-exclude='lost+found mysql sys'",
+			},
+		},
+		{
+			// A single quote in a user-supplied value must not break out of the
+			// single-quoted shell fragment that reaches bash -c.
+			name: "databases-exclude value with single quote is shell-escaped",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					ExtraOpts: []string{`--databases-exclude=od'd`},
+				},
+			},
+			mariadb:        &mariadbv1alpha1.MariaDB{},
+			targetPodIndex: 0,
+			wantArgs: []string{
+				"--backup",
+				"--stream=xbstream",
+				`--databases-exclude='lost+found od'\''d'`,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := tt.backupCmd.mariadbBackupArgs(tt.mariadb, tt.targetPodIndex)
+			if diff := cmp.Diff(args, tt.wantArgs); diff != "" {
+				t.Errorf("unexpected args (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestMariadbOperatorBackup(t *testing.T) {
+	tests := []struct {
+		name      string
+		backupCmd *BackupCommand
+		wantArgs  []string
+	}{
+		{
+			name: "logical no S3 no cleanupTargetFile",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					Path:                 "/backups",
+					BackupContentType:    mariadbv1alpha1.BackupContentTypeLogical,
+					TargetFilePath:       "/backups/0-backup-target.txt",
+					MaxRetentionDuration: 24 * time.Hour,
+					Compression:          mariadbv1alpha1.CompressGzip,
+					LogLevel:             "info",
+				},
+			},
+			wantArgs: []string{
+				"backup",
+				"--path",
+				"/backups",
+				"--target-file-path",
+				"/backups/0-backup-target.txt",
+				"--backup-content-type",
+				string(mariadbv1alpha1.BackupContentTypeLogical),
+				"--max-retention",
+				"24h0m0s",
+				"--compression",
+				"gzip",
+				"--log-level",
+				"info",
+			},
+		},
+		{
+			name: "physical no S3 no cleanupTargetFile",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					Path:                 "/backups",
+					TargetFilePath:       "/backups/0-backup-target.txt",
+					BackupContentType:    mariadbv1alpha1.BackupContentTypePhysical,
+					MaxRetentionDuration: 24 * time.Hour,
+					Compression:          mariadbv1alpha1.CompressGzip,
+					LogLevel:             "info",
+				},
+			},
+			wantArgs: []string{
+				"backup",
+				"--path",
+				"/backups",
+				"--target-file-path",
+				"/backups/0-backup-target.txt",
+				"--backup-content-type",
+				string(mariadbv1alpha1.BackupContentTypePhysical),
+				"--max-retention",
+				"24h0m0s",
+				"--compression",
+				"gzip",
+				"--log-level",
+				"info",
+			},
+		},
+		{
+			name: "logical S3",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					Path:                 "/backups",
+					TargetFilePath:       "/backups/0-backup-target.txt",
+					BackupContentType:    mariadbv1alpha1.BackupContentTypeLogical,
+					MaxRetentionDuration: 24 * time.Hour,
+					Compression:          mariadbv1alpha1.CompressGzip,
+					LogLevel:             "info",
+					S3:                   true,
+					S3Bucket:             "backups",
+					S3Endpoint:           "s3.amazonaws.com",
+					S3Region:             "us-east-1",
+					S3TLS:                true,
+					S3CACertPath:         "/etc/ssl/ca.crt",
+					S3Prefix:             "mariadb",
+				},
+			},
+			wantArgs: []string{
+				"backup",
+				"--path",
+				"/backups",
+				"--target-file-path",
+				"/backups/0-backup-target.txt",
+				"--backup-content-type",
+				string(mariadbv1alpha1.BackupContentTypeLogical),
+				"--max-retention",
+				"24h0m0s",
+				"--compression",
+				"gzip",
+				"--log-level",
+				"info",
+				"--s3",
+				"--s3-bucket",
+				"backups",
+				"--s3-endpoint",
+				"s3.amazonaws.com",
+				"--s3-region",
+				"us-east-1",
+				"--s3-tls",
+				"--s3-ca-cert-path",
+				"/etc/ssl/ca.crt",
+				"--s3-prefix",
+				"mariadb",
+			},
+		},
+		{
+			name: "physical S3",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					Path:                 "/backups",
+					TargetFilePath:       "/backups/0-backup-target.txt",
+					BackupContentType:    mariadbv1alpha1.BackupContentTypePhysical,
+					MaxRetentionDuration: 24 * time.Hour,
+					Compression:          mariadbv1alpha1.CompressGzip,
+					LogLevel:             "info",
+					S3:                   true,
+					S3Bucket:             "backups",
+					S3Endpoint:           "s3.amazonaws.com",
+					S3Region:             "us-east-1",
+					S3TLS:                true,
+					S3CACertPath:         "/etc/ssl/ca.crt",
+					S3Prefix:             "mariadb",
+				},
+			},
+			wantArgs: []string{
+				"backup",
+				"--path",
+				"/backups",
+				"--target-file-path",
+				"/backups/0-backup-target.txt",
+				"--backup-content-type",
+				string(mariadbv1alpha1.BackupContentTypePhysical),
+				"--max-retention",
+				"24h0m0s",
+				"--compression",
+				"gzip",
+				"--log-level",
+				"info",
+				"--s3",
+				"--s3-bucket",
+				"backups",
+				"--s3-endpoint",
+				"s3.amazonaws.com",
+				"--s3-region",
+				"us-east-1",
+				"--s3-tls",
+				"--s3-ca-cert-path",
+				"/etc/ssl/ca.crt",
+				"--s3-prefix",
+				"mariadb",
+			},
+		},
+		{
+			name: "logical S3 and cleanup target file",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					Path:                 "/backups",
+					TargetFilePath:       "/backups/0-backup-target.txt",
+					BackupContentType:    mariadbv1alpha1.BackupContentTypeLogical,
+					MaxRetentionDuration: 24 * time.Hour,
+					Compression:          mariadbv1alpha1.CompressGzip,
+					LogLevel:             "info",
+					S3:                   true,
+					S3Bucket:             "backups",
+					S3Endpoint:           "s3.amazonaws.com",
+					S3Region:             "us-east-1",
+					S3TLS:                true,
+					S3CACertPath:         "/etc/ssl/ca.crt",
+					S3Prefix:             "mariadb",
+					CleanupTargetFile:    true,
+				},
+			},
+			wantArgs: []string{
+				"backup",
+				"--path",
+				"/backups",
+				"--target-file-path",
+				"/backups/0-backup-target.txt",
+				"--backup-content-type",
+				string(mariadbv1alpha1.BackupContentTypeLogical),
+				"--max-retention",
+				"24h0m0s",
+				"--compression",
+				"gzip",
+				"--log-level",
+				"info",
+				"--s3",
+				"--s3-bucket",
+				"backups",
+				"--s3-endpoint",
+				"s3.amazonaws.com",
+				"--s3-region",
+				"us-east-1",
+				"--s3-tls",
+				"--s3-ca-cert-path",
+				"/etc/ssl/ca.crt",
+				"--s3-prefix",
+				"mariadb",
+				"--cleanup-target-file",
+			},
+		},
+		{
+			name: "physical S3 and cleanup target file",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					Path:                 "/backups",
+					TargetFilePath:       "/backups/0-backup-target.txt",
+					BackupContentType:    mariadbv1alpha1.BackupContentTypePhysical,
+					MaxRetentionDuration: 24 * time.Hour,
+					Compression:          mariadbv1alpha1.CompressGzip,
+					LogLevel:             "info",
+					S3:                   true,
+					S3Bucket:             "backups",
+					S3Endpoint:           "s3.amazonaws.com",
+					S3Region:             "us-east-1",
+					S3TLS:                true,
+					S3CACertPath:         "/etc/ssl/ca.crt",
+					S3Prefix:             "mariadb",
+					CleanupTargetFile:    true,
+				},
+			},
+			wantArgs: []string{
+				"backup",
+				"--path",
+				"/backups",
+				"--target-file-path",
+				"/backups/0-backup-target.txt",
+				"--backup-content-type",
+				string(mariadbv1alpha1.BackupContentTypePhysical),
+				"--max-retention",
+				"24h0m0s",
+				"--compression",
+				"gzip",
+				"--log-level",
+				"info",
+				"--s3",
+				"--s3-bucket",
+				"backups",
+				"--s3-endpoint",
+				"s3.amazonaws.com",
+				"--s3-region",
+				"us-east-1",
+				"--s3-tls",
+				"--s3-ca-cert-path",
+				"/etc/ssl/ca.crt",
+				"--s3-prefix",
+				"mariadb",
+				"--cleanup-target-file",
+			},
+		},
+		{
+			name: "zstd with compression threads",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					Path:                 "/backups",
+					BackupContentType:    mariadbv1alpha1.BackupContentTypeLogical,
+					TargetFilePath:       "/backups/0-backup-target.txt",
+					MaxRetentionDuration: 24 * time.Hour,
+					Compression:          mariadbv1alpha1.CompressZstd,
+					CompressionThreads:   ptr.To(int32(4)),
+					LogLevel:             "info",
+				},
+			},
+			wantArgs: []string{
+				"backup",
+				"--path",
+				"/backups",
+				"--target-file-path",
+				"/backups/0-backup-target.txt",
+				"--backup-content-type",
+				string(mariadbv1alpha1.BackupContentTypeLogical),
+				"--max-retention",
+				"24h0m0s",
+				"--compression",
+				"zstd",
+				"--compression-threads",
+				"4",
+				"--log-level",
+				"info",
+			},
+		},
+		{
+			name: "physical S3 and meta",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					Path:               "/backups",
+					TargetFilePath:     "/backups/0-backup-target.txt",
+					BackupFullDirPath:  "/backups/full",
+					BackupContentType:  mariadbv1alpha1.BackupContentTypePhysical,
+					PhysicalBackupMeta: true,
+					PhysicalBackupKey: &types.NamespacedName{
+						Name:      "test",
+						Namespace: "test",
+					},
+					MaxRetentionDuration: 24 * time.Hour,
+					Compression:          mariadbv1alpha1.CompressGzip,
+					LogLevel:             "info",
+					S3:                   true,
+					S3Bucket:             "backups",
+					S3Endpoint:           "s3.amazonaws.com",
+					S3Region:             "us-east-1",
+					S3TLS:                true,
+					S3CACertPath:         "/etc/ssl/ca.crt",
+					S3Prefix:             "mariadb",
+					CleanupTargetFile:    true,
+				},
+			},
+			wantArgs: []string{
+				"backup",
+				"--path",
+				"/backups",
+				"--target-file-path",
+				"/backups/0-backup-target.txt",
+				"--backup-content-type",
+				string(mariadbv1alpha1.BackupContentTypePhysical),
+				"--max-retention",
+				"24h0m0s",
+				"--compression",
+				"gzip",
+				"--log-level",
+				"info",
+				"--s3",
+				"--s3-bucket",
+				"backups",
+				"--s3-endpoint",
+				"s3.amazonaws.com",
+				"--s3-region",
+				"us-east-1",
+				"--s3-tls",
+				"--s3-ca-cert-path",
+				"/etc/ssl/ca.crt",
+				"--s3-prefix",
+				"mariadb",
+				"--cleanup-target-file",
+				"--physical-backup-dir-path",
+				"/backups/full",
+				"--physical-backup-meta",
+				"--physical-backup-name",
+				"test",
+				"--physical-backup-namespace",
+				"test",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			command, err := tt.backupCmd.MariadbOperatorBackup()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if diff := cmp.Diff(command.Args, tt.wantArgs); diff != "" {
+				t.Errorf("unexpected args (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestMariadbRestoreArgs(t *testing.T) {
+	tests := []struct {
+		name      string
+		backupCmd *BackupCommand
+		restore   *mariadbv1alpha1.Restore
+		mariadb   *mariadbv1alpha1.MariaDB
+		wantArgs  []string
+	}{
+		{
+			name:      "empty",
+			backupCmd: &BackupCommand{},
+			restore:   &mariadbv1alpha1.Restore{},
+			mariadb:   &mariadbv1alpha1.MariaDB{},
+			wantArgs:  nil,
+		},
+		{
+			name: "args",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					ExtraOpts: []string{
+						"--verbose",
+						"--one-database db1",
+					},
+				},
+			},
+			restore: &mariadbv1alpha1.Restore{},
+			mariadb: &mariadbv1alpha1.MariaDB{},
+			wantArgs: []string{
+				"--verbose",
+				"--one-database db1",
+			},
+		},
+		{
+			name: "duplicate args",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					ExtraOpts: []string{
+						"--verbose",
+						"--verbose",
+						"--one-database db1",
+					},
+				},
+			},
+			restore: &mariadbv1alpha1.Restore{},
+			mariadb: &mariadbv1alpha1.MariaDB{},
+			wantArgs: []string{
+				"--verbose",
+				"--one-database db1",
+			},
+		},
+		{
+			name:      "database",
+			backupCmd: &BackupCommand{},
+			restore: &mariadbv1alpha1.Restore{
+				Spec: mariadbv1alpha1.RestoreSpec{
+					Database: "db1",
+				},
+			},
+			mariadb: &mariadbv1alpha1.MariaDB{},
+			wantArgs: []string{
+				"--one-database db1",
+			},
+		},
+		{
+			name: "database and args",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					ExtraOpts: []string{
+						"--verbose",
+					},
+				},
+			},
+			restore: &mariadbv1alpha1.Restore{
+				Spec: mariadbv1alpha1.RestoreSpec{
+					Database: "db1",
+				},
+			},
+			mariadb: &mariadbv1alpha1.MariaDB{},
+			wantArgs: []string{
+				"--verbose",
+				"--one-database db1",
+			},
+		},
+		{
+			name:      "TLS",
+			backupCmd: &BackupCommand{},
+			restore:   &mariadbv1alpha1.Restore{},
+			mariadb: &mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					TLS: &mariadbv1alpha1.TLS{
+						Enabled: true,
+					},
+				},
+			},
+			wantArgs: []string{
+				"--ssl",
+				"--ssl-ca",
+				builderpki.CACertPath,
+				"--ssl-cert",
+				builderpki.ClientCertPath,
+				"--ssl-key",
+				builderpki.ClientKeyPath,
+				"--ssl-verify-server-cert",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := tt.backupCmd.mariadbRestoreArgs(tt.restore, tt.mariadb)
+			if diff := cmp.Diff(args, tt.wantArgs); diff != "" {
+				t.Errorf("unexpected args (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestMariadbBackupRestore(t *testing.T) {
+	tests := []struct {
+		name        string
+		backupCmd   *BackupCommand
+		mariadb     *mariadbv1alpha1.MariaDB
+		restoreOpts []MariaDBBackupRestoreOpt
+		wantErr     bool
+		wantCleanup bool
+	}{
+		{
+			name: "with database option (should error)",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					CommandOpts: CommandOpts{
+						Database: ptr.To("somedb"),
+					},
+					TargetFilePath:    "/backups/target.sql",
+					BackupFullDirPath: "/backup/full",
+				},
+			},
+			mariadb:     &mariadbv1alpha1.MariaDB{},
+			restoreOpts: nil,
+			wantErr:     true,
+			wantCleanup: false,
+		},
+		{
+			name: "basic physical restore",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					TargetFilePath:    "/backups/target.sql",
+					BackupFullDirPath: "/backup/full",
+				},
+			},
+			mariadb:     &mariadbv1alpha1.MariaDB{},
+			restoreOpts: nil,
+			wantErr:     false,
+			wantCleanup: false,
+		},
+		{
+			name: "with cleanup data dir (should include cleanup command)",
+			backupCmd: &BackupCommand{
+				BackupOpts: BackupOpts{
+					TargetFilePath:    "/backups/target.sql",
+					BackupFullDirPath: "/backup/full",
+				},
+			},
+			mariadb:     &mariadbv1alpha1.MariaDB{},
+			restoreOpts: []MariaDBBackupRestoreOpt{WithCleanupDataDir(true)},
+			wantErr:     false,
+			wantCleanup: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, err := tt.backupCmd.MariadbBackupRestore(
+				tt.mariadb,
+				"/var/lib/mysql",
+				tt.restoreOpts...,
+			)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Nil(t, cmd)
+				return
+			}
+
+			assert.NoError(t, err)
+			if assert.NotNil(t, cmd) {
+				if len(cmd.Args) == 0 {
+					t.Error("Expected command to return args")
+				}
+				script := cmd.Args[0] // NewBashCommand puts the whole script here
+				if tt.wantCleanup {
+					assert.Contains(t, script, "rm -rf /var/lib/mysql/*")
+				} else {
+					assert.NotContains(t, script, "rm -rf /var/lib/mysql/*")
+				}
+			}
+		})
+	}
+}
+
+func TestMariadbOperatorPITR(t *testing.T) {
+	startGtid := mustParseGtid(t, "0-10-1")
+	targetTime := time.Now()
+	tests := []struct {
+		name       string
+		opts       []BackupOpt
+		strictMode bool
+		wantErr    bool
+		wantArgs   []string
+	}{
+		{
+			name: "basic PITR without S3",
+			opts: []BackupOpt{
+				WithPath("/binlogs", "/binlogs/file", "/backup/full"),
+				WithStartGtid(startGtid),
+				WithTargetTime(targetTime),
+			},
+			wantArgs: []string{
+				"pitr",
+				"--path",
+				"/binlogs",
+				"--target-file-path",
+				"/binlogs/file",
+				"--start-gtid",
+				"0-10-1",
+				"--target-time",
+				targetTime.Format(time.RFC3339),
+			},
+		},
+		{
+			name: "PITR with S3",
+			opts: []BackupOpt{
+				WithPath("/binlogs", "/binlogs/file", "/backup/full"),
+				WithStartGtid(startGtid),
+				WithTargetTime(targetTime),
+				WithS3("test-bucket", "s3.example.com", "us-west-2", "prefix/"),
+				WithS3TLS(true),
+				WithS3CACertPath("/ca/cert"),
+			},
+			wantArgs: []string{
+				"pitr",
+				"--path",
+				"/binlogs",
+				"--target-file-path",
+				"/binlogs/file",
+				"--start-gtid",
+				"0-10-1",
+				"--target-time",
+				targetTime.Format(time.RFC3339),
+				"--s3",
+				"--s3-bucket",
+				"test-bucket",
+				"--s3-endpoint",
+				"s3.example.com",
+				"--s3-region",
+				"us-west-2",
+				"--s3-tls",
+				"--s3-ca-cert-path",
+				"/ca/cert",
+				"--s3-prefix",
+				"prefix/",
+			},
+		},
+		{
+			name: "PITR with compression",
+			opts: []BackupOpt{
+				WithPath("/binlogs", "/binlogs/file", "/backup/full"),
+				WithStartGtid(startGtid),
+				WithTargetTime(targetTime),
+				WithCompression(mariadbv1alpha1.CompressGzip),
+			},
+			wantArgs: []string{
+				"pitr",
+				"--path",
+				"/binlogs",
+				"--target-file-path",
+				"/binlogs/file",
+				"--start-gtid",
+				"0-10-1",
+				"--target-time",
+				targetTime.Format(time.RFC3339),
+				"--compression",
+				"gzip",
+			},
+		},
+		{
+			name: "PITR with zstd and compression threads",
+			opts: []BackupOpt{
+				WithPath("/binlogs", "/binlogs/file", "/backup/full"),
+				WithStartGtid(startGtid),
+				WithTargetTime(targetTime),
+				WithCompression(mariadbv1alpha1.CompressZstd),
+				WithCompressionThreads(ptr.To(int32(2))),
+			},
+			wantArgs: []string{
+				"pitr",
+				"--path",
+				"/binlogs",
+				"--target-file-path",
+				"/binlogs/file",
+				"--start-gtid",
+				"0-10-1",
+				"--target-time",
+				targetTime.Format(time.RFC3339),
+				"--compression",
+				"zstd",
+				"--compression-threads",
+				"2",
+			},
+		},
+		{
+			name: "PITR with log level",
+			opts: []BackupOpt{
+				WithPath("/binlogs", "/binlogs/file", "/backup/full"),
+				WithStartGtid(startGtid),
+				WithTargetTime(targetTime),
+				WithLogLevel("debug"),
+			},
+			wantArgs: []string{
+				"pitr",
+				"--path",
+				"/binlogs",
+				"--target-file-path",
+				"/binlogs/file",
+				"--start-gtid",
+				"0-10-1",
+				"--target-time",
+				targetTime.Format(time.RFC3339),
+				"--log-level",
+				"debug",
+			},
+		},
+		{
+			name: "PITR with strict mode",
+			opts: []BackupOpt{
+				WithPath("/binlogs", "/binlogs/file", "/backup/full"),
+				WithStartGtid(startGtid),
+				WithTargetTime(targetTime),
+			},
+			strictMode: true,
+			wantArgs: []string{
+				"pitr",
+				"--path",
+				"/binlogs",
+				"--target-file-path",
+				"/binlogs/file",
+				"--start-gtid",
+				"0-10-1",
+				"--target-time",
+				targetTime.Format(time.RFC3339),
+				"--strict-mode",
+			},
+		},
+		{
+			name: "PITR with all options",
+			opts: []BackupOpt{
+				WithPath("/binlogs", "/binlogs/file", "/backup/full"),
+				WithMaxRetention(30 * 24 * time.Hour),
+				WithStartGtid(startGtid),
+				WithTargetTime(targetTime),
+				WithS3("test-bucket", "s3.example.com", "us-west-2", "prefix/"),
+				WithS3TLS(true),
+				WithS3CACertPath("/ca/cert"),
+				WithCompression(mariadbv1alpha1.CompressBzip2),
+				WithLogLevel("info"),
+			},
+			strictMode: true,
+			wantArgs: []string{
+				"pitr",
+				"--path",
+				"/binlogs",
+				"--target-file-path",
+				"/binlogs/file",
+				"--start-gtid",
+				"0-10-1",
+				"--target-time",
+				targetTime.Format(time.RFC3339),
+				"--strict-mode",
+				"--s3",
+				"--s3-bucket",
+				"test-bucket",
+				"--s3-endpoint",
+				"s3.example.com",
+				"--s3-region",
+				"us-west-2",
+				"--s3-tls",
+				"--s3-ca-cert-path",
+				"/ca/cert",
+				"--s3-prefix",
+				"prefix/",
+				"--compression",
+				"bzip2",
+				"--log-level",
+				"info",
+			},
+		},
+		{
+			name: "PITR without startGtid",
+			opts: []BackupOpt{
+				WithPath("/backup", "/target/file", "/backup/full"),
+				WithTargetTime(targetTime),
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := []BackupOpt{
+				WithUserEnv("test"),
+				WithPasswordEnv("test"),
+			}
+			opts = append(opts, tt.opts...)
+			b, err := NewBackupCommand(opts...)
+			if err != nil {
+				t.Fatalf("NewBackupCommand() error = %v", err)
+			}
+
+			cmd, err := b.MariadbOperatorPITR(tt.strictMode)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("MariadbOperatorPITR() error = nil, wantErr = true")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("MariadbOperatorPITR() error = %v", err)
+			}
+
+			if diff := cmp.Diff(tt.wantArgs, cmd.Args); diff != "" {
+				t.Errorf("unexpected probe (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestMariadbBinlogArgs(t *testing.T) {
+	mdbObjectMeta := metav1.ObjectMeta{
+		Name:      "test",
+		Namespace: "test",
+	}
+	startGtid := mustParseGtid(t, "0-10-1")
+	targetTime := time.Now()
+	mdbFlags := "--user=${test} --password=${test} --host=test-primary.test.svc.cluster.local --port=3306"
+	tlsFlags := "--ssl --ssl-ca /etc/pki/ca.crt --ssl-cert /etc/pki/client.crt --ssl-key /etc/pki/client.key --ssl-verify-server-cert"
+
+	tests := []struct {
+		name     string
+		opts     []BackupOpt
+		mariadb  *mariadbv1alpha1.MariaDB
+		wantArgs []string
+		wantErr  bool
+	}{
+		{
+			name: "error when StartGtid is nil",
+			opts: []BackupOpt{
+				WithPath("/binlogs", "/binlogs/file", "/backup/full"),
+				WithTargetTime(targetTime),
+				WithUserEnv("test"),
+				WithPasswordEnv("test"),
+			},
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: mdbObjectMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+					Port: 3306,
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "valid",
+			opts: []BackupOpt{
+				WithPath("/binlogs", "/binlogs/file", "/backup/full"),
+				WithStartGtid(startGtid),
+				WithTargetTime(targetTime),
+				WithUserEnv("test"),
+				WithPasswordEnv("test"),
+			},
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: mdbObjectMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+					Port: 3306,
+				},
+			},
+			wantArgs: []string{
+				"set -euo pipefail",
+				"echo 💾 Restoring binlogs",
+				fmt.Sprintf(
+					"TZ=UTC mariadb-binlog --start-position=\"%s\" --stop-datetime=\"%s\" $(cat '/binlogs/file') | mariadb --binary-mode %s",
+					startGtid.String(),
+					targetTime.UTC().Format(time.DateTime),
+					mdbFlags,
+				),
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid with TLS",
+			opts: []BackupOpt{
+				WithPath("/binlogs", "/binlogs/file", "/backup/full"),
+				WithStartGtid(startGtid),
+				WithTargetTime(targetTime),
+				WithUserEnv("test"),
+				WithPasswordEnv("test"),
+			},
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: mdbObjectMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+					Port: 3306,
+					TLS: &mariadbv1alpha1.TLS{
+						Enabled: true,
+					},
+				},
+			},
+			wantArgs: []string{
+				"set -euo pipefail",
+				"echo 💾 Restoring binlogs",
+				fmt.Sprintf(
+					"TZ=UTC mariadb-binlog --start-position=\"%s\" --stop-datetime=\"%s\" $(cat '/binlogs/file') | mariadb --binary-mode %s %s",
+					startGtid.String(),
+					targetTime.UTC().Format(time.DateTime),
+					mdbFlags,
+					tlsFlags,
+				),
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid with extra args",
+			opts: []BackupOpt{
+				WithPath("/binlogs", "/binlogs/file", "/backup/full"),
+				WithStartGtid(startGtid),
+				WithTargetTime(targetTime),
+				WithUserEnv("test"),
+				WithPasswordEnv("test"),
+				WithExtraOpts([]string{
+					"--log-level=debug",
+				}),
+			},
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: mdbObjectMeta,
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+					Port: 3306,
+				},
+			},
+			wantArgs: []string{
+				"set -euo pipefail",
+				"echo 💾 Restoring binlogs",
+				fmt.Sprintf(
+					"TZ=UTC mariadb-binlog --start-position=\"%s\" --stop-datetime=\"%s\" $(cat '/binlogs/file') | "+
+						"mariadb --binary-mode %s --log-level=debug",
+					startGtid.String(),
+					targetTime.UTC().Format(time.DateTime),
+					mdbFlags,
+				),
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b, err := NewBackupCommand(tt.opts...)
+			if err != nil {
+				t.Fatalf("NewBackupCommand() error = %v", err)
+			}
+
+			args, err := b.mariadbBinlogArgs(tt.mariadb)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.NotNil(t, args)
+
+			if diff := cmp.Diff(tt.wantArgs, args); diff != "" {
+				t.Errorf("unexpected args (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestPhysicalBackupArgs(t *testing.T) {
+	tests := []struct {
+		name               string
+		backupContentType  mariadbv1alpha1.BackupContentType
+		backupFullDirPath  string
+		physicalBackupMeta bool
+		physicalBackupKey  *types.NamespacedName
+		wantArgs           []string
+	}{
+		{
+			name:               "Non-physical backup content type",
+			backupContentType:  mariadbv1alpha1.BackupContentTypeLogical,
+			backupFullDirPath:  "/backup/dir",
+			physicalBackupMeta: false,
+			physicalBackupKey:  nil,
+			wantArgs:           nil,
+		},
+		{
+			name:               "Physical backup with directory path",
+			backupContentType:  mariadbv1alpha1.BackupContentTypePhysical,
+			backupFullDirPath:  "/backup/dir",
+			physicalBackupMeta: false,
+			physicalBackupKey:  nil,
+			wantArgs: []string{
+				"--physical-backup-dir-path",
+				"/backup/dir",
+			},
+		},
+		{
+			name:               "Physical backup with meta and key",
+			backupContentType:  mariadbv1alpha1.BackupContentTypePhysical,
+			backupFullDirPath:  "/backup/dir",
+			physicalBackupMeta: true,
+			physicalBackupKey: &types.NamespacedName{
+				Name:      "test-backup",
+				Namespace: "test-namespace",
+			},
+			wantArgs: []string{
+				"--physical-backup-dir-path",
+				"/backup/dir",
+				"--physical-backup-meta",
+				"--physical-backup-name",
+				"test-backup",
+				"--physical-backup-namespace",
+				"test-namespace",
+			},
+		},
+		{
+			name:               "Physical backup with directory and meta but no key",
+			backupContentType:  mariadbv1alpha1.BackupContentTypePhysical,
+			backupFullDirPath:  "/backup/dir",
+			physicalBackupMeta: true,
+			physicalBackupKey:  nil,
+			wantArgs: []string{
+				"--physical-backup-dir-path",
+				"/backup/dir",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &BackupCommand{
+				BackupOpts: BackupOpts{
+					BackupContentType:  tt.backupContentType,
+					BackupFullDirPath:  tt.backupFullDirPath,
+					PhysicalBackupMeta: tt.physicalBackupMeta,
+					PhysicalBackupKey:  tt.physicalBackupKey,
+				},
+			}
+
+			if diff := cmp.Diff(b.physicalBackupArgs(), tt.wantArgs); diff != "" {
+				t.Errorf("unexpected args (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func mustParseGtid(t *testing.T, rawGtid string) *replication.Gtid {
+	gtid, err := replication.ParseGtid(rawGtid)
+	if err != nil {
+		t.Fatalf("unexpected error parsing GTID: %v", err)
+	}
+	return gtid
+}

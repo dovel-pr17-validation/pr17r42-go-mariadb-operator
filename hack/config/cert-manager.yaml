@@ -1,0 +1,8 @@
+clusterResourceNamespace: default
+
+crds: 
+  enabled: true
+  keep: true
+
+prometheus:
+  enabled: true

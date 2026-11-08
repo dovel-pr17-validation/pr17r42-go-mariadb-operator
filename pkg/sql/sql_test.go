@@ -1,0 +1,350 @@
+package sql
+
+import (
+	"net"
+	"testing"
+
+	"github.com/go-sql-driver/mysql"
+	"github.com/google/go-cmp/cmp"
+	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
+	"k8s.io/utils/ptr"
+)
+
+func TestBuildChangeMasterQuery(t *testing.T) {
+	tests := []struct {
+		name      string
+		options   []ChangeMasterOpt
+		wantQuery string
+		wantErr   bool
+	}{
+		{
+			name: "missing host",
+			options: []ChangeMasterOpt{
+				WithChangeMasterPort(3306),
+				WithChangeMasterCredentials("repl", "password"),
+			},
+			wantQuery: "",
+			wantErr:   true,
+		},
+		{
+			name: "missing credentials",
+			options: []ChangeMasterOpt{
+				WithChangeMasterHost("127.0.0.1"),
+				WithChangeMasterPort(3306),
+			},
+			wantQuery: "",
+			wantErr:   true,
+		},
+		{
+			name: "valid without SSL",
+			options: []ChangeMasterOpt{
+				WithChangeMasterHost("127.0.0.1"),
+				WithChangeMasterPort(3306),
+				WithChangeMasterCredentials("repl", "password"),
+				WithChangeMasterGtid("CurrentPos"),
+			},
+			wantQuery: `CHANGE MASTER  TO
+MASTER_HOST='127.0.0.1',
+MASTER_PORT=3306,
+MASTER_USER='repl',
+MASTER_PASSWORD='password',
+MASTER_USE_GTID=CurrentPos;
+`,
+			wantErr: false,
+		},
+		{
+			name: "valid without SSL and demoted to slave",
+			options: []ChangeMasterOpt{
+				WithChangeMasterHost("127.0.0.1"),
+				WithChangeMasterPort(3306),
+				WithChangeMasterCredentials("repl", "password"),
+				WithChangeMasterGtid("CurrentPos"),
+				WithChangeMasterDemote(true),
+			},
+			wantQuery: `CHANGE MASTER  TO
+MASTER_HOST='127.0.0.1',
+MASTER_PORT=3306,
+MASTER_USER='repl',
+MASTER_PASSWORD='password',
+MASTER_USE_GTID=slave_pos,
+MASTER_DEMOTE_TO_SLAVE=1;
+`,
+			wantErr: false,
+		},
+		{
+			name: "valid with current_pos and not demoted to slave",
+			options: []ChangeMasterOpt{
+				WithChangeMasterHost("127.0.0.1"),
+				WithChangeMasterPort(3306),
+				WithChangeMasterCredentials("repl", "password"),
+				WithChangeMasterGtid("current_pos"),
+				WithChangeMasterDemote(false),
+			},
+			wantQuery: `CHANGE MASTER  TO
+MASTER_HOST='127.0.0.1',
+MASTER_PORT=3306,
+MASTER_USER='repl',
+MASTER_PASSWORD='password',
+MASTER_USE_GTID=current_pos;
+`,
+			wantErr: false,
+		},
+		{
+			name: "valid with SSL, Retries and demoted to slave",
+			options: []ChangeMasterOpt{
+				WithChangeMasterHost("127.0.0.1"),
+				WithChangeMasterPort(3306),
+				WithChangeMasterCredentials("repl", "password"),
+				WithChangeMasterGtid("slave_pos"),
+				WithChangeMasterRetries(10),
+				WithChangeMasterSSL("/etc/pki/client.crt", "/etc/pki/client.key", "/etc/pki/ca.crt"),
+				WithChangeMasterDemote(true),
+			},
+			wantQuery: `CHANGE MASTER  TO
+MASTER_SSL=1,
+MASTER_SSL_CERT='/etc/pki/client.crt',
+MASTER_SSL_KEY='/etc/pki/client.key',
+MASTER_SSL_CA='/etc/pki/ca.crt',
+MASTER_SSL_VERIFY_SERVER_CERT=1,
+MASTER_HOST='127.0.0.1',
+MASTER_PORT=3306,
+MASTER_USER='repl',
+MASTER_PASSWORD='password',
+MASTER_CONNECT_RETRY=10,
+MASTER_USE_GTID=slave_pos,
+MASTER_DEMOTE_TO_SLAVE=1;
+`,
+			wantErr: false,
+		},
+		{
+			name: "missing SSL paths",
+			options: []ChangeMasterOpt{
+				WithChangeMasterHost("127.0.0.1"),
+				WithChangeMasterPort(3306),
+				WithChangeMasterCredentials("repl", "password"),
+				WithChangeMasterSSL("", "", ""),
+			},
+			wantQuery: "",
+			wantErr:   true,
+		},
+		{
+			name: "valid with SSL",
+			options: []ChangeMasterOpt{
+				WithChangeMasterHost("127.0.0.1"),
+				WithChangeMasterPort(3306),
+				WithChangeMasterCredentials("repl", "password"),
+				WithChangeMasterGtid("CurrentPos"),
+				WithChangeMasterSSL("/etc/pki/client.crt", "/etc/pki/client.key", "/etc/pki/ca.crt"),
+			},
+			wantQuery: `CHANGE MASTER  TO
+MASTER_SSL=1,
+MASTER_SSL_CERT='/etc/pki/client.crt',
+MASTER_SSL_KEY='/etc/pki/client.key',
+MASTER_SSL_CA='/etc/pki/ca.crt',
+MASTER_SSL_VERIFY_SERVER_CERT=1,
+MASTER_HOST='127.0.0.1',
+MASTER_PORT=3306,
+MASTER_USER='repl',
+MASTER_PASSWORD='password',
+MASTER_USE_GTID=CurrentPos;
+`,
+			wantErr: false,
+		},
+		{
+			name: "valid with Retries",
+			options: []ChangeMasterOpt{
+				WithChangeMasterHost("127.0.0.1"),
+				WithChangeMasterPort(3306),
+				WithChangeMasterCredentials("repl", "password"),
+				WithChangeMasterGtid("CurrentPos"),
+				WithChangeMasterRetries(10),
+			},
+			wantQuery: `CHANGE MASTER  TO
+MASTER_HOST='127.0.0.1',
+MASTER_PORT=3306,
+MASTER_USER='repl',
+MASTER_PASSWORD='password',
+MASTER_CONNECT_RETRY=10,
+MASTER_USE_GTID=CurrentPos;
+`,
+			wantErr: false,
+		},
+		{
+			name: "valid with custom connection",
+			options: []ChangeMasterOpt{
+				WithChangeMasterConnectionName("replica"),
+				WithChangeMasterHost("127.0.0.1"),
+				WithChangeMasterPort(3306),
+				WithChangeMasterCredentials("repl", "password"),
+				WithChangeMasterGtid("CurrentPos"),
+			},
+			wantQuery: `CHANGE MASTER 'replica' TO
+MASTER_HOST='127.0.0.1',
+MASTER_PORT=3306,
+MASTER_USER='repl',
+MASTER_PASSWORD='password',
+MASTER_USE_GTID=CurrentPos;
+`,
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			query, err := buildChangeMasterQuery(tt.options...)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error but got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if diff := cmp.Diff(query, tt.wantQuery); diff != "" {
+				t.Errorf("unexpected query (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestRequireQuery(t *testing.T) {
+	tests := []struct {
+		name      string
+		require   *mariadbv1alpha1.TLSRequirements
+		wantQuery string
+		wantErr   bool
+	}{
+		{
+			name:      "nil",
+			require:   nil,
+			wantQuery: "",
+			wantErr:   true,
+		},
+		{
+			name:      "empty",
+			require:   &mariadbv1alpha1.TLSRequirements{},
+			wantQuery: "",
+			wantErr:   true,
+		},
+		{
+			name: "SSL",
+			require: &mariadbv1alpha1.TLSRequirements{
+				SSL: ptr.To(true),
+			},
+			wantQuery: "REQUIRE SSL",
+			wantErr:   false,
+		},
+		{
+			name: "X509",
+			require: &mariadbv1alpha1.TLSRequirements{
+				X509: ptr.To(true),
+			},
+			wantQuery: "REQUIRE X509",
+			wantErr:   false,
+		},
+		{
+			name: "Issuer",
+			require: &mariadbv1alpha1.TLSRequirements{
+				Issuer: ptr.To("/CN=mariadb-galera-ca"),
+			},
+			wantQuery: "REQUIRE ISSUER '/CN=mariadb-galera-ca'",
+			wantErr:   false,
+		},
+		{
+			name: "Subject",
+			require: &mariadbv1alpha1.TLSRequirements{
+				Subject: ptr.To("/CN=mariadb-galera-client"),
+			},
+			wantQuery: "REQUIRE SUBJECT '/CN=mariadb-galera-client'",
+			wantErr:   false,
+		},
+		{
+			name: "Issuer and Subject",
+			require: &mariadbv1alpha1.TLSRequirements{
+				Issuer:  ptr.To("/CN=mariadb-galera-ca"),
+				Subject: ptr.To("/CN=mariadb-galera-client"),
+			},
+			wantQuery: "REQUIRE ISSUER '/CN=mariadb-galera-ca' AND SUBJECT '/CN=mariadb-galera-client'",
+			wantErr:   false,
+		},
+		{
+			name: "Multiple",
+			require: &mariadbv1alpha1.TLSRequirements{
+				SSL:     ptr.To(true),
+				X509:    ptr.To(true),
+				Issuer:  ptr.To("/CN=mariadb-galera-ca"),
+				Subject: ptr.To("/CN=mariadb-galera-client"),
+			},
+			wantQuery: "",
+			wantErr:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotQuery, err := requireQuery(tt.require)
+
+			if tt.wantErr && err == nil {
+				t.Error("expect error to have occurred, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("expect error to not have occurred, got: %v", err)
+			}
+			if diff := cmp.Diff(tt.wantQuery, gotQuery); diff != "" {
+				t.Errorf("unexpected bundle content (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestBuildDSNHostAndPort(t *testing.T) {
+	tests := []struct {
+		name     string
+		host     string
+		wantHost string
+	}{
+		{
+			name:     "hostname",
+			host:     "mariadb.default.svc.cluster.local",
+			wantHost: "mariadb.default.svc.cluster.local",
+		},
+		{
+			name:     "IPv4",
+			host:     "10.96.0.10",
+			wantHost: "10.96.0.10",
+		},
+		{
+			name:     "IPv6",
+			host:     "fd00:10:96::a",
+			wantHost: "fd00:10:96::a",
+		},
+		{
+			name:     "bracketed IPv6",
+			host:     "[fd00:10:96::a]",
+			wantHost: "fd00:10:96::a",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dsn, err := BuildDSN(Opts{Host: tt.host, Port: 3306, Username: "root", Password: "MariaDB11!"})
+			if err != nil {
+				t.Fatalf("BuildDSN() error = %v", err)
+			}
+			config, err := mysql.ParseDSN(dsn)
+			if err != nil {
+				t.Fatalf("mysql.ParseDSN(%q) error = %v", dsn, err)
+			}
+			host, port, err := net.SplitHostPort(config.Addr)
+			if err != nil {
+				t.Fatalf("net.SplitHostPort(%q) error = %v", config.Addr, err)
+			}
+			if host != tt.wantHost || port != "3306" {
+				t.Errorf("BuildDSN() address = %q, want host %q and port 3306", config.Addr, tt.wantHost)
+			}
+		})
+	}
+}

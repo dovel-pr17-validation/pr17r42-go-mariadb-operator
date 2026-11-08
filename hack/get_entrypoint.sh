@@ -1,0 +1,71 @@
+#!/bin/bash
+
+set -euo pipefail
+
+if [ -z "$MARIADB_DOCKER_REPO" ]; then 
+  echo "MARIADB_DOCKER_REPO environment variable is mandatory"
+  exit 1
+fi
+if [ -z "$MARIADB_DOCKER_COMMIT_HASH" ]; then 
+  echo "MARIADB_DOCKER_COMMIT_HASH environment variable is mandatory"
+  exit 1
+fi
+if [ -z "$MARIADB_ENTRYPOINT_PATH" ]; then 
+  echo "MARIADB_ENTRYPOINT_PATH environment variable is mandatory"
+  exit 1
+fi
+
+# Clone the repository
+if [ -d "mariadb-docker" ]; then
+  rm -rf mariadb-docker
+fi
+echo "Cloning repository $MARIADB_DOCKER_REPO"
+git clone -q --no-progress "$MARIADB_DOCKER_REPO" mariadb-docker
+cd mariadb-docker
+echo "Checking out commit $MARIADB_DOCKER_COMMIT_HASH"
+git checkout -q --no-progress "$MARIADB_DOCKER_COMMIT_HASH"
+cd -
+
+# Prepare the entrypoint directory
+if [ -d "$MARIADB_ENTRYPOINT_PATH" ]; then
+  rm -rf "$MARIADB_ENTRYPOINT_PATH"
+fi
+
+shopt -s nullglob
+version_dirs=()
+for candidate in mariadb-docker/*; do
+  base=$(basename "$candidate")
+  if [[ -d "$candidate" && "$base" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    version_dirs+=("$candidate")
+  fi
+done
+IFS=$'\n' sorted_dirs=($(printf "%s\n" "${version_dirs[@]}" | sort -V))
+for VERSION_DIR in "${sorted_dirs[@]}"; do
+  VERSION=$(basename "$VERSION_DIR")
+  ENTRYPOINT="$VERSION_DIR/docker-entrypoint.sh"
+  
+  if [ -f "$ENTRYPOINT" ]; then
+    DEST="$MARIADB_ENTRYPOINT_PATH/$VERSION"
+    mkdir -p "$DEST"
+    cp "$ENTRYPOINT" "$DEST"
+    echo "Copied docker-entrypoint.sh for version \"$VERSION\""
+  else
+    echo "❌ Error: docker-entrypoint.sh not found for version \"$VERSION\""
+    exit 1
+  fi
+done
+
+ENTRYPOINT_PATH=mariadb-docker/main-ubi
+if [ -f "${ENTRYPOINT_PATH}"/Dockerfile ]; then
+  VERSION=$(sed -n 's/ARG MARIADB_VERSION=\([0-9]*\.[0-9]*\).*/\1/p' "${ENTRYPOINT_PATH}"/Dockerfile)
+  DEST="$MARIADB_ENTRYPOINT_PATH/$VERSION"
+   if [ -n "$VERSION" ] && [ ! -d "$DEST" ]; then
+     mkdir -p "$DEST"
+     cp "$ENTRYPOINT_PATH"/docker-entrypoint.sh "$DEST"
+     echo "Copied docker-entrypoint.sh for version \"$VERSION\" from $ENTRYPOINT_PATH"
+   fi
+fi
+
+# Cleanup
+rm -rf mariadb-docker
+echo "Done!"

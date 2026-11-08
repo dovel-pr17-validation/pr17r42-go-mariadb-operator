@@ -1,0 +1,218 @@
+package replication
+
+import (
+	"context"
+	"net/http"
+	"sync/atomic"
+	"time"
+
+	"github.com/go-logr/logr"
+	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/agent/router"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/environment"
+	mdbhttp "github.com/mariadb-operator/mariadb-operator/v26/pkg/http"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/sql"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+type ReplicationProbe struct {
+	mariadbKey      types.NamespacedName
+	k8sClient       ctrlclient.Client
+	env             *environment.PodEnvironment
+	responseWriter  *mdbhttp.ResponseWriter
+	livenessLogger  logr.Logger
+	readinessLogger logr.Logger
+	// lastMaxLagSeconds caches the last max lag read from the MariaDB, used when the Kubernetes API is unreachable.
+	lastMaxLagSeconds atomic.Int64
+}
+
+var requestTimeout = 3 * time.Second
+
+func NewReplicationProbe(env *environment.PodEnvironment, k8sClient ctrlclient.Client, responseWriter *mdbhttp.ResponseWriter,
+	logger *logr.Logger) router.ProbeHandler {
+	return &ReplicationProbe{
+		mariadbKey: types.NamespacedName{
+			Name:      env.MariadbName,
+			Namespace: env.PodNamespace,
+		},
+		k8sClient:       k8sClient,
+		env:             env,
+		responseWriter:  responseWriter,
+		livenessLogger:  logger.WithName("liveness"),
+		readinessLogger: logger.WithName("readiness"),
+	}
+}
+
+func (p *ReplicationProbe) Liveness(w http.ResponseWriter, r *http.Request) {
+	p.livenessLogger.V(1).Info("Probe started")
+
+	sqlCtx, sqlCancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer sqlCancel()
+
+	sqlClient, err := sql.NewLocalClientWithPodEnv(sqlCtx, p.env, sql.WithTimeout(requestTimeout))
+	if err != nil {
+		p.livenessLogger.Error(err, "error getting SQL client")
+		p.responseWriter.WriteErrorf(w, "error getting SQL client: %v", err)
+		return
+	}
+	defer sqlClient.Close()
+
+	isReplica, err := sqlClient.IsReplicationReplica(sqlCtx)
+	if err != nil {
+		p.livenessLogger.Error(err, "error checking replica")
+		p.responseWriter.WriteErrorf(w, "error checking replica: %v", err)
+		return
+	}
+	if isReplica {
+		status, err := sqlClient.ReplicaStatus(sqlCtx, p.livenessLogger)
+		if err != nil {
+			p.livenessLogger.Error(err, "error getting replica status")
+			p.responseWriter.WriteErrorf(w, "error getting replica status: %v", err)
+			return
+		}
+
+		replicaIORunning := ptr.Deref(status.SlaveIORunning, false)
+		if !replicaIORunning {
+			// A stopped IO thread with no error (Last_IO_Errno == 0) is an administrative stop:
+			// the multi-cluster and cluster switchover flows stop replicas before reconfiguring GTIDs,
+			// a DBA running STOP SLAVE, maintenance, etc. Restarting the container does not remediate
+			// an intentional stop, it only disrupts whatever operation caused it, so this must not
+			// fail liveness. A stop accompanied by an error is a genuine replication failure and is
+			// still treated as fatal.
+			lastIOErrno := ptr.Deref(status.LastIOErrno, 0)
+			if lastIOErrno != 0 {
+				p.livenessLogger.Error(nil, "Replica IO thread not running",
+					"Last_IO_Errno", lastIOErrno,
+					"Last_IO_Error", ptr.Deref(status.LastIOError, ""),
+				)
+				p.responseWriter.WriteErrorf(w, "Replica IO thread not running (Last_IO_Errno: %d)", lastIOErrno)
+				return
+			}
+			p.livenessLogger.Info("Replica IO thread stopped without error, treating as administrative stop")
+		}
+		replicaSQLRunning := ptr.Deref(status.SlaveSQLRunning, false)
+		if !replicaSQLRunning {
+			// A stopped SQL thread with no error (Last_SQL_Errno == 0) is an administrative stop:
+			// --safe-slave-backup, a DBA running STOP SLAVE SQL_THREAD, maintenance, etc. Restarting
+			// the container does not remediate an intentional stop, it only disrupts whatever operation
+			// caused it, so this must not fail liveness. A stop accompanied by an error is a genuine
+			// replication failure and is still treated as fatal.
+			lastSQLErrno := ptr.Deref(status.LastSQLErrno, 0)
+			if lastSQLErrno != 0 {
+				p.livenessLogger.Error(nil, "Replica SQL thread not running",
+					"Last_SQL_Errno", lastSQLErrno,
+					"Last_SQL_Error", ptr.Deref(status.LastSQLError, ""),
+				)
+				p.responseWriter.WriteErrorf(w, "Replica SQL thread not running (Last_SQL_Errno: %d)", lastSQLErrno)
+				return
+			}
+			p.livenessLogger.Info("Replica SQL thread stopped without error, treating as administrative stop")
+		}
+
+		p.livenessLogger.V(1).Info(
+			"Replica thread running status",
+			"Slave_IO_Running", replicaIORunning,
+			"Slave_SQL_Running", replicaSQLRunning,
+		)
+		p.responseWriter.WriteOK(w, nil)
+		return
+	}
+
+	isPrimary, err := sqlClient.IsReplicationPrimary(sqlCtx)
+	if err != nil {
+		p.livenessLogger.Error(err, "error checking primary")
+		p.responseWriter.WriteErrorf(w, "error checking primary: %v", err)
+		return
+	}
+	if !isPrimary {
+		p.livenessLogger.Error(nil, "Primary not configured")
+		p.responseWriter.WriteError(w, "Primary not configured")
+		return
+	}
+
+	p.responseWriter.WriteOK(w, nil)
+}
+
+func (p *ReplicationProbe) Readiness(w http.ResponseWriter, r *http.Request) {
+	p.readinessLogger.V(1).Info("Probe started")
+
+	sqlCtx, sqlCancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer sqlCancel()
+
+	k8sCtx, k8sCancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer k8sCancel()
+
+	sqlClient, err := sql.NewLocalClientWithPodEnv(sqlCtx, p.env, sql.WithTimeout(requestTimeout))
+	if err != nil {
+		p.readinessLogger.Error(err, "error getting SQL client")
+		p.responseWriter.WriteErrorf(w, "error getting SQL client: %v", err)
+		return
+	}
+	defer sqlClient.Close()
+
+	isReplica, err := sqlClient.IsReplicationReplica(sqlCtx)
+	if err != nil {
+		p.readinessLogger.Error(err, "error checking replica")
+		p.responseWriter.WriteErrorf(w, "error checking replica: %v", err)
+		return
+	}
+	if isReplica {
+		status, err := sqlClient.ReplicaStatus(sqlCtx, p.readinessLogger)
+		if err != nil {
+			p.readinessLogger.Error(err, "error getting replica status")
+			p.responseWriter.WriteErrorf(w, "error getting replica status: %v", err)
+			return
+		}
+		if status.SecondsBehindMaster == nil {
+			p.readinessLogger.Error(nil, "could not determine replica lag")
+			p.responseWriter.WriteError(w, "could not determine replica lag")
+			return
+		}
+		secondsBehindMaster := *status.SecondsBehindMaster
+
+		maxLagSeconds := p.getMaxLagSeconds(k8sCtx)
+		if secondsBehindMaster > maxLagSeconds {
+			p.readinessLogger.Error(nil, "Replica is lagging behind master", "seconds", secondsBehindMaster, "max-seconds", maxLagSeconds)
+			p.responseWriter.WriteErrorf(w, "Replica is lagging %d seconds behind master (max seconds: %d)", secondsBehindMaster, maxLagSeconds)
+			return
+		}
+
+		p.readinessLogger.V(1).Info(
+			"Replica lag status",
+			"seconds", secondsBehindMaster,
+			"max-seconds", maxLagSeconds,
+		)
+		p.responseWriter.WriteOK(w, nil)
+		return
+	}
+
+	isPrimary, err := sqlClient.IsReplicationPrimary(sqlCtx)
+	if err != nil {
+		p.readinessLogger.Error(err, "error checking primary")
+		p.responseWriter.WriteErrorf(w, "error checking primary: %v", err)
+		return
+	}
+	if !isPrimary {
+		p.readinessLogger.Error(nil, "Primary not configured")
+		p.responseWriter.WriteError(w, "Primary not configured")
+		return
+	}
+
+	p.responseWriter.WriteOK(w, nil)
+}
+
+func (p *ReplicationProbe) getMaxLagSeconds(ctx context.Context) int {
+	var mdb mariadbv1alpha1.MariaDB
+	if err := p.k8sClient.Get(ctx, p.mariadbKey, &mdb); err != nil {
+		maxLagSeconds := int(p.lastMaxLagSeconds.Load())
+		p.readinessLogger.Error(err, "error getting MariaDB. Using last known max replication lag", "max-seconds", maxLagSeconds)
+		return maxLagSeconds
+	}
+	replication := ptr.Deref(mdb.Spec.Replication, mariadbv1alpha1.Replication{})
+	replica := replication.Replica
+	maxLagSeconds := ptr.Deref(replica.MaxLagSeconds, 0)
+	p.lastMaxLagSeconds.Store(int64(maxLagSeconds))
+	return maxLagSeconds
+}

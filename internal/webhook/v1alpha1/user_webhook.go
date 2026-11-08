@@ -1,0 +1,133 @@
+package v1alpha1
+
+import (
+	"context"
+	"slices"
+
+	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	ctrl "sigs.k8s.io/controller-runtime"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+)
+
+// log is for logging in this package.
+var userlog = logf.Log.WithName("user-resource")
+
+// SetupUserWebhookWithManager registers the webhook for User in the manager.
+func SetupUserWebhookWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewWebhookManagedBy(mgr, &mariadbv1alpha1.User{}).
+		WithValidator(&UserCustomValidator{}).
+		Complete()
+}
+
+// +kubebuilder:webhook:path=/validate-k8s-mariadb-com-v1alpha1-user,mutating=false,failurePolicy=fail,sideEffects=None,groups=k8s.mariadb.com,resources=users,verbs=create;update,versions=v1alpha1,name=vuser-v1alpha1.kb.io,admissionReviewVersions=v1
+
+// UserCustomValidator struct is responsible for validating the User resource
+// when it is created, updated, or deleted.
+type UserCustomValidator struct{}
+
+var _ admission.Validator[*mariadbv1alpha1.User] = &UserCustomValidator{}
+
+// ValidateCreate implements webhook.CustomValidator so a webhook will be registered for the type User.
+func (v *UserCustomValidator) ValidateCreate(ctx context.Context, user *mariadbv1alpha1.User) (admission.Warnings, error) {
+	userlog.V(1).Info("Validation for User upon creation", "name", user.GetName())
+
+	validateFns := []func(user *mariadbv1alpha1.User) error{
+		validatePassword,
+		validateUserCleanupPolicy,
+		validateRequire,
+	}
+	for _, fn := range validateFns {
+		if err := fn(user); err != nil {
+			return nil, err
+		}
+	}
+	return nil, nil
+}
+
+// ValidateUpdate implements webhook.CustomValidator so a webhook will be registered for the type User.
+func (v *UserCustomValidator) ValidateUpdate(ctx context.Context, oldUser, user *mariadbv1alpha1.User) (admission.Warnings, error) {
+	userlog.V(1).Info("Validation for User upon update", "name", user.GetName())
+
+	if err := immutableWebhook.ValidateUpdate(user, oldUser); err != nil {
+		return nil, err
+	}
+	validateFns := []func(user *mariadbv1alpha1.User) error{
+		validatePassword,
+		validateUserCleanupPolicy,
+		validateRequire,
+	}
+	for _, fn := range validateFns {
+		if err := fn(user); err != nil {
+			return nil, err
+		}
+	}
+	return nil, nil
+}
+
+// ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type User.
+func (v *UserCustomValidator) ValidateDelete(ctx context.Context, user *mariadbv1alpha1.User) (admission.Warnings, error) {
+	return nil, nil
+}
+
+func validatePasswordPlugin(user *mariadbv1alpha1.User) error {
+	if user.Spec.PasswordPlugin.PluginArgSecretKeyRef != nil && user.Spec.PasswordPlugin.PluginNameSecretKeyRef == nil {
+		return field.Invalid(
+			field.NewPath("spec").Child("passwordPlugin").Child("pluginArgSecretKeyRef"),
+			user.Spec.PasswordPlugin.PluginArgSecretKeyRef,
+			"'spec.passwordPlugin.pluginArgSecretKeyRef' can only be set when 'spec.passwordPlugin.pluginNameSecretKeyRef' is set",
+		)
+
+	}
+	return nil
+}
+
+func validatePassword(user *mariadbv1alpha1.User) error {
+	if err := validatePasswordPlugin(user); err != nil {
+		return err
+	}
+
+	definedPasswordMethods := []bool{
+		user.Spec.PasswordSecretKeyRef != nil,
+		user.Spec.PasswordHashSecretKeyRef != nil,
+		user.Spec.PasswordPlugin.PluginNameSecretKeyRef != nil,
+	}
+	definedPasswordMethods = slices.DeleteFunc(definedPasswordMethods, func(v bool) bool { return !v })
+
+	if len(definedPasswordMethods) > 1 {
+		return field.Invalid(
+			field.NewPath("spec").Child("passwordSecretKeyRef"),
+			user.Spec.PasswordSecretKeyRef,
+			"Only one of 'spec.passwordSecretKeyRef', 'spec.passwordHashSecretKeyRef', or "+
+				"'spec.passwordPlugin.pluginNameSecretKeyRef' can be defined",
+		)
+	}
+	return nil
+}
+
+func validateUserCleanupPolicy(user *mariadbv1alpha1.User) error {
+	if user.Spec.CleanupPolicy != nil {
+		if err := user.Spec.CleanupPolicy.Validate(); err != nil {
+			return field.Invalid(
+				field.NewPath("spec").Child("cleanupPolicy"),
+				user.Spec.CleanupPolicy,
+				err.Error(),
+			)
+		}
+	}
+	return nil
+}
+
+func validateRequire(user *mariadbv1alpha1.User) error {
+	if require := user.Spec.Require; require != nil {
+		if err := require.Validate(); err != nil {
+			return field.Invalid(
+				field.NewPath("spec").Child("require"),
+				user.Spec.Require,
+				err.Error(),
+			)
+		}
+	}
+	return nil
+}

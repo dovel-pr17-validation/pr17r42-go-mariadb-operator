@@ -1,0 +1,352 @@
+package v1alpha1
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+
+	"github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/datastructures"
+	galerakeys "github.com/mariadb-operator/mariadb-operator/v26/pkg/galera/config/keys"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+)
+
+// log is for logging in this package.
+var mariadblog = logf.Log.WithName("mariadb-resource")
+
+// SetupMariaDBWebhookWithManager registers the webhook for MariaDB in the manager.
+func SetupMariaDBWebhookWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewWebhookManagedBy(mgr, &v1alpha1.MariaDB{}).
+		WithValidator(&MariaDBCustomValidator{}).
+		Complete()
+}
+
+// +kubebuilder:webhook:path=/validate-k8s-mariadb-com-v1alpha1-mariadb,mutating=false,failurePolicy=fail,sideEffects=None,groups=k8s.mariadb.com,resources=mariadbs,verbs=create;update,versions=v1alpha1,name=vmariadb-v1alpha1.kb.io,admissionReviewVersions=v1
+
+// MariaDBCustomValidator struct is responsible for validating the MariaDB resource
+// when it is created, updated, or deleted.
+type MariaDBCustomValidator struct{}
+
+var _ admission.Validator[*v1alpha1.MariaDB] = &MariaDBCustomValidator{}
+
+// ValidateCreate implements webhook.CustomValidator so a webhook will be registered for the type MariaDB.
+func (v *MariaDBCustomValidator) ValidateCreate(ctx context.Context, mariadb *v1alpha1.MariaDB) (admission.Warnings, error) {
+	mariadblog.V(1).Info("Validation for MariaDB upon creation", "name", mariadb.GetName())
+
+	validateFns := []func(*v1alpha1.MariaDB) error{
+		validateHA,
+		validateGalera,
+		validateReplication,
+		validateBootstrapFrom,
+		validatePodDisruptionBudget,
+		validateStorage,
+		validateRootPassword,
+		validateMaxScale,
+		validateTLS,
+		validateMultiCluster,
+	}
+	for _, fn := range validateFns {
+		if err := fn(mariadb); err != nil {
+			return nil, err
+		}
+	}
+	return nil, nil
+}
+
+// ValidateUpdate implements webhook.CustomValidator so a webhook will be registered for the type MariaDB.
+func (v *MariaDBCustomValidator) ValidateUpdate(ctx context.Context, oldMariadb, mariadb *v1alpha1.MariaDB) (admission.Warnings, error) {
+	mariadblog.V(1).Info("Validation for MariaDB upon update", "name", mariadb.GetName())
+
+	if err := immutableWebhook.ValidateUpdate(mariadb, oldMariadb); err != nil {
+		return nil, err
+	}
+	validateFns := []func(*v1alpha1.MariaDB) error{
+		validateHA,
+		validateGalera,
+		validateReplication,
+		validateBootstrapFrom,
+		validatePodDisruptionBudget,
+		validateStorage,
+		validateRootPassword,
+		validateTLS,
+		validateMultiCluster,
+	}
+	for _, fn := range validateFns {
+		if err := fn(mariadb); err != nil {
+			return nil, err
+		}
+	}
+
+	return nil, validateUpdateStorage(mariadb, oldMariadb)
+}
+
+// ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type MariaDB.
+func (v *MariaDBCustomValidator) ValidateDelete(ctx context.Context, mariadb *v1alpha1.MariaDB) (admission.Warnings, error) {
+	return nil, nil
+}
+
+func validateHA(mariadb *v1alpha1.MariaDB) error {
+	if mariadb.IsReplicationEnabled() && mariadb.IsGaleraEnabled() {
+		return errors.New("you may only enable one HA method at a time, either 'spec.replication' or 'spec.galera'")
+	}
+	if !mariadb.IsHAEnabled() && mariadb.Spec.Replicas > 1 {
+		return field.Invalid(
+			field.NewPath("spec").Child("replicas"),
+			mariadb.Spec.Replicas,
+			"Multiple replicas can only be specified when 'spec.replication' or 'spec.galera' are configured",
+		)
+	}
+	if mariadb.IsHAEnabled() && mariadb.Spec.Replicas <= 1 {
+		return field.Invalid(
+			field.NewPath("spec").Child("replicas"),
+			mariadb.Spec.Replicas,
+			"Multiple replicas must be specified when 'spec.replication' or 'spec.galera' are configured",
+		)
+	}
+	return nil
+}
+
+func validateMaxScale(mariadb *v1alpha1.MariaDB) error {
+	return nil
+}
+
+func validateGalera(mariadb *v1alpha1.MariaDB) error {
+	galera := ptr.Deref(mariadb.Spec.Galera, v1alpha1.Galera{})
+	if !galera.Enabled {
+		return nil
+	}
+
+	if galera.Primary.PodIndex != nil {
+		if *galera.Primary.PodIndex < 0 || *galera.Primary.PodIndex >= int(mariadb.Spec.Replicas) {
+			return field.Invalid(
+				field.NewPath("spec").Child("galera").Child("primary").Child("podIndex"),
+				ptr.Deref(mariadb.Spec.Galera, v1alpha1.Galera{}).Primary.PodIndex,
+				"'spec.galera.primary.podIndex' out of 'spec.replicas' bounds",
+			)
+		}
+	}
+
+	if !reflect.ValueOf(galera.SST).IsZero() {
+		if err := galera.SST.Validate(); err != nil {
+			return field.Invalid(
+				field.NewPath("spec").Child("galera").Child("sst"),
+				galera.SST,
+				err.Error(),
+			)
+		}
+	}
+
+	if galera.ReplicaThreads < 0 {
+		return field.Invalid(
+			field.NewPath("spec").Child("galera").Child("replicaThreads"),
+			galera.ReplicaThreads,
+			"'spec.galera.replicaThreads' must be at least 1",
+		)
+	}
+
+	_, exists := galera.ProviderOptions[galerakeys.WsrepOptISTRecvAddr]
+	if exists {
+		return field.Invalid(
+			field.NewPath("spec").Child("galera").Child("providerOptions"),
+			galera.ProviderOptions,
+			"'spec.galera.providerOptions' cannot contain: ist.recv_addr",
+		)
+	}
+
+	if err := galera.Agent.Validate(); err != nil {
+		return field.Invalid(
+			field.NewPath("spec").Child("galera").Child("agent"),
+			galera.Agent,
+			err.Error(),
+		)
+	}
+
+	if galera.Recovery != nil {
+		if err := galera.Recovery.Validate(mariadb); err != nil {
+			return field.Invalid(
+				field.NewPath("spec").Child("galera").Child("recovery"),
+				galera.Recovery,
+				err.Error(),
+			)
+		}
+	}
+
+	return nil
+}
+
+func validateReplication(mariadb *v1alpha1.MariaDB) error {
+	replication := ptr.Deref(mariadb.Spec.Replication, v1alpha1.Replication{})
+	if !replication.Enabled {
+		return nil
+	}
+	if replication.Primary.PodIndex != nil {
+		if *replication.Primary.PodIndex < 0 || *replication.Primary.PodIndex >= int(mariadb.Spec.Replicas) {
+			return field.Invalid(
+				field.NewPath("spec").Child("replication").Child("primary").Child("podIndex"),
+				replication.Primary.PodIndex,
+				"'spec.replication.primary.podIndex' out of 'spec.replicas' bounds",
+			)
+		}
+	}
+	if err := replication.Validate(); err != nil {
+		return field.Invalid(
+			field.NewPath("spec").Child("replication"),
+			replication,
+			err.Error(),
+		)
+	}
+	if err := replication.Replica.Validate(); err != nil {
+		return field.Invalid(
+			field.NewPath("spec").Child("replication").Child("replica"),
+			replication.Replica,
+			err.Error(),
+		)
+	}
+	return nil
+}
+
+func validateBootstrapFrom(mariadb *v1alpha1.MariaDB) error {
+	if mariadb.Spec.BootstrapFrom == nil {
+		return nil
+	}
+	if err := mariadb.Spec.BootstrapFrom.Validate(); err != nil {
+		return field.Invalid(
+			field.NewPath("spec").Child("bootstrapFrom"),
+			mariadb.Spec.BootstrapFrom,
+			err.Error(),
+		)
+	}
+	return nil
+}
+
+func validatePodDisruptionBudget(mariadb *v1alpha1.MariaDB) error {
+	if mariadb.Spec.PodDisruptionBudget == nil {
+		return nil
+	}
+	if err := mariadb.Spec.PodDisruptionBudget.Validate(); err != nil {
+		return field.Invalid(
+			field.NewPath("spec").Child("podDisruptionBudget"),
+			mariadb.Spec.PodDisruptionBudget,
+			err.Error(),
+		)
+	}
+	return nil
+}
+
+func validateStorage(mariadb *v1alpha1.MariaDB) error {
+	if err := mariadb.Spec.Storage.Validate(mariadb); err != nil {
+		return field.Invalid(
+			field.NewPath("spec").Child("storage"),
+			mariadb.Spec.Storage,
+			err.Error(),
+		)
+	}
+	return nil
+}
+
+func validateUpdateStorage(mariadb, old *v1alpha1.MariaDB) error {
+	if err := validateStorage(mariadb); err != nil {
+		return err
+	}
+	currentSize := mariadb.Spec.Storage.GetSize()
+	oldSize := old.Spec.Storage.GetSize()
+
+	if currentSize != nil && oldSize != nil && currentSize.Cmp(*oldSize) < 0 {
+		return field.Invalid(
+			field.NewPath("spec").Child("storage"),
+			mariadb.Spec.Storage,
+			"Storage size cannot be decreased",
+		)
+	}
+	return nil
+}
+
+func validateRootPassword(mariadb *v1alpha1.MariaDB) error {
+	if mariadb.IsRootPasswordEmpty() && mariadb.IsRootPasswordDefined() {
+		return field.Invalid(
+			field.NewPath("spec").Child("rootEmptyPassword"),
+			mariadb.Spec.RootEmptyPassword,
+			"'spec.rootEmptyPassword' must be disabled when 'spec.rootPasswordSecretKeyRef' is specified",
+		)
+	}
+	return nil
+}
+
+func validateTLS(mariadb *v1alpha1.MariaDB) error {
+	tls := ptr.Deref(mariadb.Spec.TLS, v1alpha1.TLS{})
+	if !tls.Enabled {
+		return nil
+	}
+	validationItems := []tlsValidationItem{
+		{
+			tlsValue:            mariadb.Spec.TLS,
+			caSecretRef:         tls.ServerCASecretRef,
+			caFieldPath:         "spec.tls.serverCASecretRef",
+			certSecretRef:       tls.ServerCertSecretRef,
+			certFieldPath:       "spec.tls.serverCertSecretRef",
+			certIssuerRef:       tls.ServerCertIssuerRef,
+			certIssuerFieldPath: "spec.tls.serverCertIssuerRef",
+		},
+		{
+			tlsValue:            mariadb.Spec.TLS,
+			caSecretRef:         tls.ClientCASecretRef,
+			caFieldPath:         "spec.tls.clientCASecretRef",
+			certSecretRef:       tls.ClientCertSecretRef,
+			certFieldPath:       "spec.tls.clientCertSecretRef",
+			certIssuerRef:       tls.ClientCertIssuerRef,
+			certIssuerFieldPath: "spec.tls.clientCertIssuerRef",
+		},
+	}
+	for _, item := range validationItems {
+		if err := validateTLSCert(&item); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateMultiCluster(mariadb *v1alpha1.MariaDB) error {
+	multiCluster := ptr.Deref(mariadb.Spec.MultiCluster, v1alpha1.MultiCluster{})
+	if !multiCluster.Enabled {
+		return nil
+	}
+	if !mariadb.IsGaleraEnabled() && !mariadb.IsReplicationEnabled() {
+		return field.Invalid(
+			field.NewPath("spec").Child("multiCluster").Child("enabled"),
+			multiCluster.Enabled,
+			"either replication or Galera must be enabled when multi-cluster is enabled.",
+		)
+	}
+
+	if multiCluster.Primary == "" {
+		return field.Invalid(
+			field.NewPath("spec").Child("multiCluster").Child("primary"),
+			multiCluster.Primary,
+			"'spec.multiCluster.primary' must be specified",
+		)
+	}
+
+	memberIndex := datastructures.NewIndex(multiCluster.Members, func(m v1alpha1.MultiClusterMember) string {
+		return m.Name
+	})
+	if !datastructures.Has(memberIndex, mariadb.Name) {
+		return field.Invalid(
+			field.NewPath("spec").Child("multiCluster").Child("members"),
+			multiCluster.Members,
+			fmt.Sprintf("current cluster %s is not defined as a multi-cluster member.", mariadb.Name),
+		)
+	}
+	if !datastructures.Has(memberIndex, multiCluster.Primary) {
+		return field.Invalid(
+			field.NewPath("spec").Child("multiCluster").Child("members"),
+			multiCluster.Members,
+			fmt.Sprintf("primary cluster %s is not defined as a multi-cluster member.", multiCluster.Primary),
+		)
+	}
+	return nil
+}

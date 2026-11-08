@@ -1,0 +1,386 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/go-logr/logr"
+	"github.com/hashicorp/go-multierror"
+	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
+	condition "github.com/mariadb-operator/mariadb-operator/v26/pkg/condition"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/replication"
+	mdbpod "github.com/mariadb-operator/mariadb-operator/v26/pkg/pod"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/sql"
+	stspkg "github.com/mariadb-operator/mariadb-operator/v26/pkg/statefulset"
+	appsv1 "k8s.io/api/apps/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+func (r *MariaDBReconciler) reconcileStatus(ctx context.Context, mdb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
+	if mdb.IsSuspended() {
+		return ctrl.Result{}, r.patchStatus(ctx, mdb, func(status *mariadbv1alpha1.MariaDBStatus) error {
+			condition.SetReadySuspended(status)
+			return nil
+		})
+	}
+	logger := log.FromContext(ctx).WithName("status").V(1)
+
+	var sts appsv1.StatefulSet
+	if err := r.Get(ctx, client.ObjectKeyFromObject(mdb), &sts); err != nil {
+		logger.Info("error getting StatefulSet", "err", err)
+	}
+
+	replRoles, replErr := r.getReplicationRoles(ctx, mdb)
+	if replErr != nil {
+		logger.Info("error getting replication state", "err", replErr)
+	}
+	replStatus, replErrStatusErr := r.getReplicaStatus(ctx, mdb, logger)
+	if replErrStatusErr != nil {
+		logger.Info("error getting replication status", "err", replStatus)
+	}
+
+	mxsPrimaryPodIndex, mxsErr := r.getMaxScalePrimaryPod(ctx, mdb)
+	if mxsErr != nil {
+		logger.Info("error getting MaxScale primary Pod", "err", mxsErr)
+	}
+
+	tlsStatus, err := r.getTLSStatus(ctx, mdb)
+	if err != nil {
+		logger.Info("error getting TLS status", "err", err)
+	}
+
+	return ctrl.Result{}, r.patchStatus(ctx, mdb, func(status *mariadbv1alpha1.MariaDBStatus) error {
+		status.DefaultVersion = r.Environment.MariadbDefaultVersion
+		status.Replicas = sts.Status.ReadyReplicas
+		defaultPrimary(mdb)
+		setMaxScalePrimary(mdb, mxsPrimaryPodIndex)
+
+		if replRoles != nil {
+			if status.Replication == nil {
+				status.Replication = &mariadbv1alpha1.ReplicationStatus{}
+			}
+			status.Replication.Roles = replRoles
+		}
+		if replStatus != nil {
+			if status.Replication == nil {
+				status.Replication = &mariadbv1alpha1.ReplicationStatus{}
+			}
+			status.Replication.Replicas = replStatus
+		}
+		// reset replication status after a cluster-level switchover
+		if mdb.IsMultiClusterPrimary() && mdb.IsGaleraEnabled() {
+			status.Replication = nil
+		}
+
+		if tlsStatus != nil {
+			status.TLS = tlsStatus
+		}
+
+		if apierrors.IsNotFound(mxsErr) && mdb.IsMaxScaleEnabled() {
+			r.ConditionReady.PatcherRefResolver(mxsErr, mariadbv1alpha1.MaxScale{})(&mdb.Status)
+			return nil
+		}
+		if mdb.IsRestoringBackup() || mdb.IsResizingStorage() || mdb.IsSwitchingPrimary() || mdb.HasGaleraNotReadyCondition() {
+			return nil
+		}
+
+		if err := r.setUpdatedCondition(ctx, mdb); err != nil {
+			log.FromContext(ctx).V(1).Info("error setting MariaDB updated condition", "err", err)
+		}
+		condition.SetReadyWithMariaDB(&mdb.Status, &sts, mdb)
+		return nil
+	})
+}
+
+func shouldReconcileReplicationRoleForPod(mdb *mariadbv1alpha1.MariaDB, podIndex int) bool {
+	return mdb.IsReplicationEnabled() ||
+		(mdb.IsGaleraEnabled() && mdb.IsMultiClusterPrimaryReplica(podIndex))
+}
+
+func (r *MariaDBReconciler) getReplicationRoles(ctx context.Context,
+	mdb *mariadbv1alpha1.MariaDB) (map[string]mariadbv1alpha1.ReplicationRole, error) {
+	clientSet := sql.NewClientSet(mdb, r.RefResolver)
+	defer clientSet.Close()
+
+	var replState map[string]mariadbv1alpha1.ReplicationRole
+	logger := log.FromContext(ctx)
+	for i := 0; i < int(mdb.Spec.Replicas); i++ {
+		if !shouldReconcileReplicationRoleForPod(mdb, i) {
+			continue
+		}
+		pod := stspkg.PodName(mdb.ObjectMeta, i)
+
+		client, err := clientSet.ClientForIndex(ctx, i)
+		if err != nil {
+			logger.V(1).Info("error getting client for Pod", "err", err, "pod", pod)
+			continue
+		}
+		role, err := r.getReplicationRole(ctx, mdb, i, client, logger)
+		if err != nil {
+			logger.V(1).Info("error getting Pod replication role", "err", err, "pod", pod)
+			continue
+		}
+
+		if replState == nil {
+			replState = make(map[string]mariadbv1alpha1.ReplicationRole)
+		}
+		replState[pod] = role
+	}
+	return replState, nil
+}
+
+func (r *MariaDBReconciler) getReplicationRole(ctx context.Context, mdb *mariadbv1alpha1.MariaDB, podIndex int,
+	client *sql.Client, logger logr.Logger) (mariadbv1alpha1.ReplicationRole, error) {
+	var (
+		err              error
+		aggErr           *multierror.Error
+		isPrimaryReplica bool
+		isReplica        bool
+		isPrimary        bool
+	)
+
+	isPrimaryReplica, err = r.isMultiClusterPrimaryReplica(ctx, mdb, podIndex, client, logger)
+	if err != nil && !sql.IsConnectionNotExists(err) {
+		aggErr = multierror.Append(aggErr, err)
+	}
+	isReplica, err = client.IsReplicationReplica(ctx)
+	aggErr = multierror.Append(aggErr, err)
+	isPrimary, err = client.HasConnectedReplicas(ctx)
+	aggErr = multierror.Append(aggErr, err)
+
+	if err := aggErr.ErrorOrNil(); err != nil {
+		return mariadbv1alpha1.ReplicationRoleUnknown, err
+	}
+
+	role := mariadbv1alpha1.ReplicationRoleUnknown
+	if isPrimaryReplica {
+		role = mariadbv1alpha1.ReplicationRolePrimaryReplica
+	} else if isReplica {
+		role = mariadbv1alpha1.ReplicationRoleReplica
+	} else if isPrimary {
+		role = mariadbv1alpha1.ReplicationRolePrimary
+	}
+	return role, nil
+}
+
+func (r *MariaDBReconciler) isMultiClusterPrimaryReplica(ctx context.Context, mdb *mariadbv1alpha1.MariaDB, podIndex int,
+	client *sql.Client, logger logr.Logger) (bool, error) {
+	if !mdb.IsMultiClusterPrimaryReplica(podIndex) {
+		return false, nil
+	}
+	if mdb.IsReplicationEnabled() {
+		return client.IsReplicationPrimaryReplica(
+			ctx,
+			logger,
+			sql.WithConnectionName(replication.MultiClusterReplicaConnectionName),
+		)
+	} else if mdb.IsGaleraEnabled() {
+		return client.IsReplicationRunning(
+			ctx,
+			logger,
+			sql.WithConnectionName(replication.MultiClusterReplicaConnectionName),
+		)
+	}
+	return false, nil
+}
+
+func shouldReconcileReplicaStatusForPod(mdb *mariadbv1alpha1.MariaDB, podIndex int) bool {
+	isReplica := podIndex != *mdb.Status.CurrentPrimaryPodIndex
+	if mdb.IsMultiClusterEnabled() {
+		if mdb.IsReplicationEnabled() {
+			return isReplica || mdb.IsMultiClusterPrimaryReplica(podIndex)
+		} else if mdb.IsGaleraEnabled() {
+			return mdb.IsMultiClusterPrimaryReplica(podIndex)
+		}
+		return false
+	}
+	return isReplica
+}
+
+func (r *MariaDBReconciler) getReplicaStatus(ctx context.Context,
+	mdb *mariadbv1alpha1.MariaDB, logger logr.Logger) (map[string]mariadbv1alpha1.ReplicaStatus, error) {
+	replStatus := ptr.Deref(mdb.Status.Replication, mariadbv1alpha1.ReplicationStatus{})
+
+	if mdb.Status.CurrentPrimaryPodIndex == nil {
+		return replStatus.Replicas, nil
+	}
+
+	clientSet := sql.NewClientSet(mdb, r.RefResolver)
+	defer clientSet.Close()
+
+	var replicaStatus map[string]mariadbv1alpha1.ReplicaStatus
+	for i := 0; i < int(mdb.Spec.Replicas); i++ {
+		if !shouldReconcileReplicaStatusForPod(mdb, i) {
+			continue
+		}
+		pod := stspkg.PodName(mdb.ObjectMeta, i)
+
+		var currentReplicaStatus *mariadbv1alpha1.ReplicaStatus
+		if current, ok := replStatus.Replicas[pod]; ok {
+			currentReplicaStatus = &current
+		}
+		// when the Pods are restarted or unstable, SQL connections could fail, keep the current state
+		preserveCurrentState := func() {
+			if replicaStatus == nil {
+				replicaStatus = make(map[string]mariadbv1alpha1.ReplicaStatus)
+			}
+			if currentReplicaStatus != nil {
+				replicaStatus[pod] = *currentReplicaStatus
+			}
+		}
+
+		client, err := clientSet.ClientForIndex(ctx, i)
+		if err != nil {
+			logger.V(1).Info("error getting client for Pod", "err", err, "pod", pod)
+			preserveCurrentState()
+			continue
+		}
+
+		var replOpts []sql.ReplicationOpt
+		if mdb.IsMultiClusterPrimaryReplica(i) {
+			replOpts = append(replOpts, sql.WithConnectionName(replication.MultiClusterReplicaConnectionName))
+		}
+		newReplicaStatus, err := client.ReplicaStatus(ctx, logger, replOpts...)
+		if err != nil {
+			logger.V(1).Info("error checking Pod replica status", "err", err, "pod", pod)
+			preserveCurrentState()
+			continue
+		}
+
+		mergedReplicaStatus := mergeReplicaStatus(currentReplicaStatus, newReplicaStatus)
+		if mergedReplicaStatus != nil {
+			if replicaStatus == nil {
+				replicaStatus = make(map[string]mariadbv1alpha1.ReplicaStatus)
+			}
+			replicaStatus[pod] = *mergedReplicaStatus
+		}
+	}
+	return replicaStatus, nil
+}
+
+func (r *MariaDBReconciler) getMaxScalePrimaryPod(ctx context.Context, mdb *mariadbv1alpha1.MariaDB) (*int, error) {
+	if !mdb.IsMaxScaleEnabled() {
+		return nil, nil
+	}
+	mxs, err := r.RefResolver.MaxScale(ctx, mdb.Spec.MaxScaleRef, mdb.Namespace)
+	if err != nil {
+		return nil, err
+	}
+	primarySrv := mxs.Status.GetPrimaryServer()
+	if primarySrv == nil {
+		return nil, errors.New("MaxScale primary server not found")
+	}
+	podIndex, err := podIndexForServer(*primarySrv, mxs, mdb)
+	if err != nil {
+		return nil, fmt.Errorf("error getting Pod for MaxScale server '%s': %v", *primarySrv, err)
+	}
+	return podIndex, nil
+}
+
+func (r *MariaDBReconciler) setUpdatedCondition(ctx context.Context, mdb *mariadbv1alpha1.MariaDB) error {
+	var sts appsv1.StatefulSet
+	if err := r.Get(ctx, client.ObjectKeyFromObject(mdb), &sts); err != nil {
+		return err
+	}
+	if sts.Status.UpdateRevision == "" {
+		return nil
+	}
+
+	pods, err := mdbpod.ListMariaDBPods(ctx, r.Client, mdb)
+	if err != nil {
+		return fmt.Errorf("error listing Pods: %v", err)
+	}
+
+	podsUpdated := 0
+	for _, pod := range pods {
+		if mdbpod.PodUpdated(&pod, sts.Status.UpdateRevision) {
+			podsUpdated++
+		}
+	}
+
+	logger := log.FromContext(ctx)
+
+	if podsUpdated >= int(sts.Status.Replicas) {
+		logger.V(1).Info("MariaDB is up to date")
+		condition.SetUpdated(&mdb.Status)
+	} else if podsUpdated > 0 {
+		logger.V(1).Info("MariaDB update in progress")
+		condition.SetUpdating(&mdb.Status)
+	} else {
+		logger.V(1).Info("MariaDB has a pending update")
+		condition.SetPendingUpdate(&mdb.Status)
+	}
+	return nil
+}
+
+func mergeReplicaStatus(current *mariadbv1alpha1.ReplicaStatus,
+	new *mariadbv1alpha1.ReplicaStatusVars) *mariadbv1alpha1.ReplicaStatus {
+	if new == nil {
+		return current
+	}
+	now := metav1.Now()
+	// First report — initialize new status
+	if current == nil {
+		return &mariadbv1alpha1.ReplicaStatus{
+			ReplicaStatusVars:       *new,
+			LastErrorTransitionTime: now,
+		}
+	}
+	// No error state change
+	if current.EqualErrors(new) {
+		return &mariadbv1alpha1.ReplicaStatus{
+			ReplicaStatusVars:       *new,
+			LastErrorTransitionTime: current.LastErrorTransitionTime,
+		}
+	}
+	// Transition: healthy <-> error or changed error type
+	return &mariadbv1alpha1.ReplicaStatus{
+		ReplicaStatusVars:       *new,
+		LastErrorTransitionTime: now,
+	}
+}
+
+func podIndexForServer(serverName string, mxs *mariadbv1alpha1.MaxScale, mdb *mariadbv1alpha1.MariaDB) (*int, error) {
+	var server *mariadbv1alpha1.MaxScaleServer
+	for _, srv := range mxs.Spec.Servers {
+		if serverName == srv.Name {
+			server = &srv
+			break
+		}
+	}
+	if server == nil {
+		return nil, fmt.Errorf("MaxScale server '%s' not found", serverName)
+	}
+	return mxs.ServerAddressPodIndex(mdb, server.Address)
+}
+
+func defaultPrimary(mdb *mariadbv1alpha1.MariaDB) {
+	if mdb.Status.CurrentPrimaryPodIndex != nil || mdb.Status.CurrentPrimary != nil {
+		return
+	}
+	podIndex := 0
+	if mdb.IsGaleraEnabled() {
+		galera := ptr.Deref(mdb.Spec.Galera, mariadbv1alpha1.Galera{})
+		podIndex = ptr.Deref(galera.Primary.PodIndex, 0)
+	}
+	if mdb.IsReplicationEnabled() {
+		replication := ptr.Deref(mdb.Spec.Replication, mariadbv1alpha1.Replication{})
+		podIndex = ptr.Deref(replication.Primary.PodIndex, 0)
+	}
+	mdb.Status.CurrentPrimaryPodIndex = &podIndex
+	mdb.Status.CurrentPrimary = ptr.To(stspkg.PodName(mdb.ObjectMeta, podIndex))
+}
+
+func setMaxScalePrimary(mdb *mariadbv1alpha1.MariaDB, podIndex *int) {
+	if !mdb.IsMaxScaleEnabled() || podIndex == nil {
+		return
+	}
+	mdb.Status.CurrentPrimaryPodIndex = podIndex
+	mdb.Status.CurrentPrimary = ptr.To(stspkg.PodName(mdb.ObjectMeta, *podIndex))
+}

@@ -1,0 +1,9 @@
+resources:
+- manager.yaml
+- namespace.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+images:
+- name: controller
+  newName: ghcr.io/mariadb-operator/mariadb-operator
+  newTag: 0.37.1-dev

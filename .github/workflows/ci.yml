@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request: {}
+
+env:
+  GOLANGCI_VERSION: "v2.13.2"
+
+jobs:
+  detect-noop:
+    name: Detect noop
+    runs-on: ubuntu-latest
+    outputs:
+      noop: ${{ steps.noop.outputs.should_skip }}
+    steps:
+      - name: Detect no-op changes
+        id: noop
+        uses: fkirc/skip-duplicate-actions@v5.3.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          paths_ignore: '["*.md","*.md.gotmpl",".github/**","docs/**","examples/**"]'
+          concurrent_skipping: false
+          skip_after_successful_duplicate: false
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    needs: detect-noop
+    if: ${{ needs.detect-noop.outputs.noop != 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: GolangCI Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ env.GOLANGCI_VERSION }}
+
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    needs: detect-noop
+    if: ${{ needs.detect-noop.outputs.noop != 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Find typos
+        uses: crate-ci/typos@v1.51.1
+        with:
+          files: ./api ./cmd ./internal ./pkg
+          config: ./.typos.toml
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: detect-noop
+    if: ${{ needs.detect-noop.outputs.noop != 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: Build
+        run: make build
+
+      - name: Build Docker
+        run: make docker-build
+
+  unit-test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    needs: detect-noop
+    if: ${{ needs.detect-noop.outputs.noop != 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: Test
+        run: |
+          make helm-crds
+          make test
+  integration-test:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    needs: detect-noop
+    if: ${{ needs.detect-noop.outputs.noop != 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: Determine test
+        id: test
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "Detected push to main. Running full tests."
+            echo "type=full" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "pull_request" && "${{ github.head_ref }}" =~ ^(release|feature|fix).*$ ]]; then
+            echo "Detected PR from release, feature or fix branch. Running full tests."
+            echo "type=full" >> "$GITHUB_OUTPUT"
+          else
+            echo "Defaulting to basic tests"
+            echo "type=basic" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cluster
+        run: |
+          make cluster
+          make install
+          make install-csi-hostpath
+          make install-minio
+          make install-cert-manager
+          make net
+          make install-azurite
+
+      - name: Run basic integration tests
+        if: ${{ steps.test.outputs.type == 'basic' }}
+        run: make test-int-basic
+
+      - name: Run integration tests
+        if: ${{ steps.test.outputs.type == 'full' }}
+        run: make test-int
+
+      - name: Run multi-cluster integration tests
+        if: ${{ steps.test.outputs.type == 'full' }}
+        run: make test-int-multi-cluster
+
+      - name: Post Test Debugging (on failure)
+        if: failure()
+        run: make dump
+
+  artifacts:
+    name: Artifacts
+    runs-on: ubuntu-latest
+    needs: detect-noop
+    if: ${{ needs.detect-noop.outputs.noop != 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Generate
+        run: make gen
+
+      - name: Check diff
+        uses: mmontes11/diff-porcelain@v0.0.1
+        with:
+          message: Generated artifacts are not up to date. Run 'make gen' and commit the changes.
+
+      - name: Check CRD size
+        run: make crd-size
